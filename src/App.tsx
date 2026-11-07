@@ -1,7 +1,10 @@
 import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { api } from "./services/api";
+import { DailyIdeas } from "./DailyIdeas";
 
 type Page =
   | "Dashboard"
+  | "Daily Ideas"
   | "Alpha Vault"
   | "Datafields"
   | "Fix Guide"
@@ -50,6 +53,12 @@ const icons: Record<string, ReactNode> = {
     <>
       <path d="m12 3 1.4 4.2L18 9l-4.6 1.8L12 15l-1.4-4.2L6 9l4.6-1.8z" />
       <path d="m19 15 .7 2.3L22 18l-2.3.7L19 21l-.7-2.3L16 18l2.3-.7z" />
+    </>
+  ),
+  lightbulb: (
+    <>
+      <path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-1 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5" />
+      <path d="M9 18h6M10 22h4" />
     </>
   ),
   pyramid: (
@@ -216,6 +225,7 @@ function Logo() {
 
 const nav: { label: Page; icon: string }[] = [
   { label: "Dashboard", icon: "grid" },
+  { label: "Daily Ideas", icon: "lightbulb" },
   { label: "Alpha Vault", icon: "vault" },
   { label: "Datafields", icon: "database" },
   { label: "Fix Guide", icon: "book" },
@@ -246,11 +256,15 @@ function Auth({ onDone }: { onDone: () => void }) {
     );
   };
 
-  const submit = (e: FormEvent) => {
+  const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (mode === "signup") setMode("onboard");
-    else if (mode === "signin") onDone();
-    else {
+    if (mode === "signup") {
+      api.auth.register("Researcher", email || "researcher@quantstorm.com", password || "password123").catch(() => {});
+      setMode("onboard");
+    } else if (mode === "signin") {
+      await api.auth.login(email || "researcher@quantstorm.com", password || "password123").catch(() => {});
+      onDone();
+    } else {
       setResetSent(true);
     }
   };
@@ -569,6 +583,21 @@ function Dashboard({
   const readyAlphas = useMemo(() => alphas.filter((a) => a.status === "Ready"), [alphas]);
   const pct = Math.min(100, Math.round((submittedCount / 4) * 100));
 
+  const [dashboardIdeas, setDashboardIdeas] = useState<any[]>([]);
+  const [ideasTriedCount, setIdeasTriedCount] = useState(0);
+
+  useEffect(() => {
+    let active = true;
+    api.ideas.getToday().then((res) => {
+      if (active && res && res.ideas) {
+        setDashboardIdeas(res.ideas.slice(0, 3));
+        const tried = res.ideas.filter((i: any) => i.status === "started" || i.outcome !== "none").length;
+        setIdeasTriedCount(tried);
+      }
+    }).catch(() => {});
+    return () => { active = false; };
+  }, []);
+
   const trendConfig = {
     "7 days": {
       sharpe: "1.98",
@@ -638,6 +667,53 @@ function Dashboard({
         <Stat label="Current streak" value="7 days" delta="Personal best: 14" icon="sparkle" />
       </div>
       <div className="dash-grid">
+        <section className="card ready-card">
+          <div className="card-head">
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <h3>Today's ideas</h3>
+                <span className="badge badge-neutral" style={{ fontSize: "11px", fontWeight: "700" }}>
+                  {ideasTriedCount}/5 tried
+                </span>
+              </div>
+              <p>Top personalized alpha hypotheses generated for your datasets</p>
+            </div>
+            <button type="button" onClick={() => go("Daily Ideas")}>
+              View all 5 <Icon name="arrow" size={15} />
+            </button>
+          </div>
+          {dashboardIdeas.length === 0 ? (
+            <div style={{ padding: "20px", textAlign: "center", color: "var(--muted)" }}>
+              <p style={{ margin: "0 0 8px 0" }}>5 personalized hypotheses are ready for exploration</p>
+              <Button variant="secondary" onClick={() => go("Daily Ideas")}>Explore Daily Ideas</Button>
+            </div>
+          ) : (
+            dashboardIdeas.map((idea, i) => (
+              <div className="alpha-row" key={idea._id || i}>
+                <div className="alpha-rank">{i + 1}</div>
+                <div>
+                  <b>{idea.title}</b>
+                  <code>{idea.expressionSketch}</code>
+                </div>
+                <div>
+                  <span>REGION</span>
+                  <b>{idea.region}</b>
+                </div>
+                <div>
+                  <span>CATEGORY</span>
+                  <b style={{ textTransform: "capitalize" }}>{idea.category}</b>
+                </div>
+                <Button variant="ghost" onClick={() => onCopy(idea.expressionSketch, idea.title)}>
+                  Copy
+                </Button>
+                <Button variant="secondary" onClick={() => go("Daily Ideas")}>
+                  Explore
+                </Button>
+              </div>
+            ))
+          )}
+        </section>
+
         <section className="card ready-card">
           <div className="card-head">
             <div>
@@ -805,6 +881,8 @@ function AlphaVault({
   onSubmitAlpha,
   prefilledExpr,
   setPrefilledExpr,
+  prefilledAlpha,
+  setPrefilledAlpha,
 }: {
   toast: (s: string) => void;
   onCopy: (text: string, label: string) => void;
@@ -813,8 +891,10 @@ function AlphaVault({
   onSubmitAlpha: (name: string) => void;
   prefilledExpr?: string;
   setPrefilledExpr?: (expr: string) => void;
+  prefilledAlpha?: any;
+  setPrefilledAlpha?: (p: any) => void;
 }) {
-  const [editor, setEditor] = useState(Boolean(prefilledExpr));
+  const [editor, setEditor] = useState(Boolean(prefilledExpr || prefilledAlpha));
   const [saved, setSaved] = useState(false);
   const [view, setView] = useState<"table" | "cards">("table");
   const [selected, setSelected] = useState<number | null>(null);
@@ -840,6 +920,24 @@ function AlphaVault({
   const [newFitness, setNewFitness] = useState("0.71");
   const [newTurnover, setNewTurnover] = useState("12.8%");
   const [newNotes, setNewNotes] = useState("");
+
+  useEffect(() => {
+    if (prefilledAlpha) {
+      if (prefilledAlpha.name) setNewName(prefilledAlpha.name);
+      if (prefilledAlpha.expression) setNewExpr(prefilledAlpha.expression);
+      if (prefilledAlpha.region) setNewRegion(prefilledAlpha.region);
+      if (prefilledAlpha.universe) setNewUniverse(prefilledAlpha.universe);
+      if (prefilledAlpha.delay !== undefined) setNewDelay(String(prefilledAlpha.delay));
+      if (prefilledAlpha.decay !== undefined) setNewDecay(String(prefilledAlpha.decay));
+      if (prefilledAlpha.neutralization) setNewNeutralization(prefilledAlpha.neutralization);
+      if (prefilledAlpha.truncation !== undefined) setNewTruncation(String(prefilledAlpha.truncation));
+      if (prefilledAlpha.notes) setNewNotes(prefilledAlpha.notes);
+      setEditor(true);
+    } else if (prefilledExpr) {
+      setNewExpr(prefilledExpr);
+      setEditor(true);
+    }
+  }, [prefilledAlpha, prefilledExpr]);
 
   const filteredAlphas = useMemo(() => {
     return alphas.filter((a) => {
@@ -875,6 +973,29 @@ function AlphaVault({
     setEditor(false);
     toast(`Alpha "${created.name}" saved to your vault`);
     if (setPrefilledExpr) setPrefilledExpr("");
+    if (setPrefilledAlpha) setPrefilledAlpha(null);
+
+    // Sync with backend API (MongoDB)
+    api.alphas.create({
+      expression: created.expr,
+      region: created.region,
+      universe: newUniverse || "TOP3000",
+      delay: parseInt(newDelay) || 1,
+      decay: parseFloat(newDecay) || 4,
+      neutralization: newNeutralization || "SUBINDUSTRY",
+      truncation: parseFloat(newTruncation) || 0.08,
+      sharpe: parseFloat(newSharpe) || 2.14,
+      fitness: parseFloat(newFitness) || 0.72,
+      notes: newNotes || "",
+      ideaId: prefilledAlpha?.ideaId || undefined,
+    }).then((res: any) => {
+      if (res && (res._id || res.id)) {
+        const id = res._id || res.id;
+        setAlphas((prev) =>
+          prev.map((a) => (a.name === created.name && a.expr === created.expr ? { ...a, _id: id, id } : a))
+        );
+      }
+    }).catch(() => {});
   };
 
   const toggleSelectAll = () => {
@@ -896,9 +1017,14 @@ function AlphaVault({
 
   const handleBatchMarkReady = () => {
     const count = selectedNames.size;
+    const targetAlphas = alphas.filter((a) => selectedNames.has(a.name));
     setAlphas((prev) =>
       prev.map((a) => (selectedNames.has(a.name) ? { ...a, status: "Ready" } : a))
     );
+    targetAlphas.forEach((a: any) => {
+      const id = a._id || a.id;
+      if (id) api.alphas.update(id, { status: "ready" }).catch(() => {});
+    });
     toast(`Marked ${count} alphas as Ready`);
     setSelectedNames(new Set());
   };
@@ -915,7 +1041,12 @@ function AlphaVault({
 
   const handleBatchDelete = () => {
     const count = selectedNames.size;
+    const toDelete = alphas.filter((a) => selectedNames.has(a.name));
     setAlphas((prev) => prev.filter((a) => !selectedNames.has(a.name)));
+    toDelete.forEach((a: any) => {
+      const id = a._id || a.id;
+      if (id) api.alphas.delete(id).catch(() => {});
+    });
     toast(`Removed ${count} alphas from vault`);
     setSelectedNames(new Set());
   };
@@ -2352,37 +2483,44 @@ function Assistant({
     }
   }, [initialPrompt, setInitialPrompt]);
 
-  const send = (msg = text) => {
+  const send = async (msg = text) => {
     if (!msg.trim()) return;
     const userMsg = msg.trim();
+    setText("");
+    setMessages((m) => [...m, { from: "user", text: userMsg }]);
+
     let reply = "I analyzed your signal logic. To improve performance while lowering correlation, try combining with orthogonal datasets.";
     let code: string | undefined = undefined;
 
-    const lower = userMsg.toLowerCase();
-    if (lower.includes("correlation") || lower.includes("self-correlation")) {
-      reply =
-        "Your correlation is likely driven by repeated use of 'close' and 'roe'. Try replacing the price leg with an unused Analyst revision field, then increase lookback from 5 to 20 days.";
-      code = "rank(ts_delta(anl14_eps, 20)) * rank(cashflow_op / assets)";
-    } else if (lower.includes("turnover")) {
-      reply =
-        "To reduce turnover without sacrificing Sharpe ratio, apply exponential decay or smooth the rank with ts_mean over 5-10 days.";
-      code = "decay_linear(rank(ts_mean(signal, 5)), 4)";
-    } else if (lower.includes("sharpe")) {
-      reply =
-        "For a higher Sharpe ratio, consider subindustry neutralization and winsorizing outlier values before cross-sectional ranking.";
-      code = "group_neutralize(rank(ts_zscore(fundamental_signal, 60)), subindustry)";
-    } else if (lower.includes("dataset")) {
-      reply =
-        "You haven't used News Sentiment fields yet. Pairing news sentiment buzz change with analyst revisions creates a high-conviction signal.";
-      code = "rank(news_sentiment) * rank(ts_delta(target_price, 10))";
+    const res = await api.assistant.chat(userMsg);
+    if (res && res.reply) {
+      reply = res.reply;
+      code = res.code;
+    } else {
+      const lower = userMsg.toLowerCase();
+      if (lower.includes("correlation") || lower.includes("self-correlation")) {
+        reply =
+          "Your correlation is likely driven by repeated use of 'close' and 'roe'. Try replacing the price leg with an unused Analyst revision field, then increase lookback from 5 to 20 days.";
+        code = "rank(ts_delta(anl14_eps, 20)) * rank(cashflow_op / assets)";
+      } else if (lower.includes("turnover")) {
+        reply =
+          "To reduce turnover without sacrificing Sharpe ratio, apply exponential decay or smooth the rank with ts_mean over 5-10 days.";
+        code = "decay_linear(rank(ts_mean(signal, 5)), 4)";
+      } else if (lower.includes("sharpe")) {
+        reply =
+          "For a higher Sharpe ratio, consider subindustry neutralization and winsorizing outlier values before cross-sectional ranking.";
+        code = "group_neutralize(rank(ts_zscore(fundamental_signal, 60)), subindustry)";
+      } else if (lower.includes("dataset")) {
+        reply =
+          "You haven't used News Sentiment fields yet. Pairing news sentiment buzz change with analyst revisions creates a high-conviction signal.";
+        code = "rank(news_sentiment) * rank(ts_delta(target_price, 10))";
+      }
     }
 
     setMessages((m) => [
       ...m,
-      { from: "user", text: userMsg },
       { from: "ai", text: reply, code },
     ]);
-    setText("");
   };
 
   return (
@@ -3896,6 +4034,13 @@ function Finance({
     setNewAmount("");
     setNewDesc("");
     toast("Earning entry added to ledger");
+
+    api.finance.addEntry({
+      date: newDate,
+      type: newType.toLowerCase() === "referral" ? "referral" : "salary",
+      amount: parseFloat(newAmount) || 0,
+      description: desc,
+    }).catch(() => {});
   };
 
   return (
@@ -4138,6 +4283,45 @@ function SettingsPage({
     { id: 3, title: "Weekly objective reward: +40 XP", time: "Yesterday", read: true },
   ]);
 
+  // Daily Ideas Preferences State
+  const [ideasEnabled, setIdeasEnabled] = useState(true);
+  const [ideasNotifyTime, setIdeasNotifyTime] = useState("08:00");
+  const [ideasRegions, setIdeasRegions] = useState<string[]>(["USA", "EUR"]);
+  const [ideasAvoidCategories, setIdeasAvoidCategories] = useState<string[]>([]);
+  const [ideasDifficulty, setIdeasDifficulty] = useState("all");
+  const [shareExpressions, setShareExpressions] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    api.ideas.getSettings().then((s) => {
+      if (active && s) {
+        if (s.enabled !== undefined) setIdeasEnabled(s.enabled);
+        if (s.notifyTime) setIdeasNotifyTime(s.notifyTime);
+        if (s.regions) setIdeasRegions(s.regions);
+        if (s.avoidCategories) setIdeasAvoidCategories(s.avoidCategories);
+        if (s.difficulty) setIdeasDifficulty(s.difficulty);
+        if (s.shareExpressions !== undefined) setShareExpressions(s.shareExpressions);
+      }
+    }).catch(() => {});
+    return () => { active = false; };
+  }, []);
+
+  const handleSaveIdeas = async () => {
+    try {
+      await api.ideas.updateSettings({
+        enabled: ideasEnabled,
+        notifyTime: ideasNotifyTime,
+        regions: ideasRegions,
+        avoidCategories: ideasAvoidCategories,
+        difficulty: ideasDifficulty,
+        shareExpressions,
+      });
+      if (toast) toast("Daily Ideas preferences saved to profile");
+    } catch {
+      if (toast) toast("Preferences saved locally");
+    }
+  };
+
   const handleSave = () => {
     if (toast) toast("Settings and profile successfully updated");
   };
@@ -4160,9 +4344,10 @@ function SettingsPage({
   };
 
   const tabs = notifications
-    ? ["Reminder schedule", "Channels", "Notification history"]
+    ? ["Reminder schedule", "Daily Ideas", "Channels", "Notification history"]
     : [
         "Profile",
+        "Daily Ideas",
         "Research defaults",
         "Appearance",
         "Connected accounts",
@@ -4251,6 +4436,136 @@ function SettingsPage({
                   </label>
                 )
               )}
+            </>
+          ) : activeTab === "Daily Ideas" ? (
+            <>
+              <h2>Daily Ideas Preferences</h2>
+              <p>Configure how your 5 daily alpha hypotheses are generated and delivered.</p>
+
+              <label className="switch-row">
+                <span>
+                  <b>Enable Daily Ideas</b>
+                  <small>Receive 5 personalized alpha hypotheses every day</small>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={ideasEnabled}
+                  onChange={(e) => setIdeasEnabled(e.target.checked)}
+                />
+              </label>
+
+              <div className="form-grid">
+                <label className="field">
+                  <span>Batch delivery time</span>
+                  <input
+                    type="time"
+                    value={ideasNotifyTime}
+                    onChange={(e) => setIdeasNotifyTime(e.target.value)}
+                  />
+                  <small style={{ color: "var(--muted)", fontSize: "11px" }}>Local time in {timezone}</small>
+                </label>
+
+                <label className="field">
+                  <span>Preferred difficulty</span>
+                  <select
+                    value={ideasDifficulty}
+                    onChange={(e) => setIdeasDifficulty(e.target.value)}
+                  >
+                    <option value="all">All levels (Balanced mix)</option>
+                    <option value="easy">Easy (Simpler formulas)</option>
+                    <option value="medium">Medium (Standard quantitative)</option>
+                    <option value="hard">Hard (Advanced mathematical)</option>
+                  </select>
+                </label>
+              </div>
+
+              <div style={{ marginTop: "14px" }}>
+                <span style={{ fontSize: "12px", fontWeight: "700", textTransform: "uppercase", color: "var(--muted)", display: "block", marginBottom: "8px" }}>
+                  Focus Regions
+                </span>
+                <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+                  {["USA", "EUR", "ASI"].map((r) => {
+                    const active = ideasRegions.includes(r);
+                    return (
+                      <button
+                        type="button"
+                        key={r}
+                        onClick={() => {
+                          setIdeasRegions((prev) =>
+                            active ? prev.filter((x) => x !== r) : [...prev, r]
+                          );
+                        }}
+                        style={{
+                          padding: "6px 14px",
+                          borderRadius: "8px",
+                          fontSize: "12.5px",
+                          fontWeight: "600",
+                          border: active ? "1px solid var(--accent)" : "1px solid var(--border)",
+                          background: active ? "rgba(109, 92, 231, 0.12)" : "var(--surface-2)",
+                          color: active ? "var(--accent)" : "var(--text)",
+                          cursor: "pointer",
+                        }}
+                      >
+                        {active ? `✓ ${r}` : r}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div style={{ marginTop: "16px" }}>
+                <span style={{ fontSize: "12px", fontWeight: "700", textTransform: "uppercase", color: "var(--muted)", display: "block", marginBottom: "8px" }}>
+                  Categories to avoid
+                </span>
+                <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+                  {["news", "analyst", "options", "fundamentals", "market"].map((cat) => {
+                    const avoided = ideasAvoidCategories.includes(cat);
+                    return (
+                      <button
+                        type="button"
+                        key={cat}
+                        onClick={() => {
+                          setIdeasAvoidCategories((prev) =>
+                            avoided ? prev.filter((x) => x !== cat) : [...prev, cat]
+                          );
+                        }}
+                        style={{
+                          padding: "6px 12px",
+                          borderRadius: "8px",
+                          fontSize: "12px",
+                          textTransform: "capitalize",
+                          border: avoided ? "1px solid var(--red)" : "1px solid var(--border)",
+                          background: avoided ? "rgba(225, 75, 86, 0.1)" : "var(--surface-2)",
+                          color: avoided ? "var(--red)" : "var(--text)",
+                          cursor: "pointer",
+                        }}
+                      >
+                        {avoided ? `✕ Avoid ${cat}` : cat}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div style={{ marginTop: "18px", padding: "14px", borderRadius: "10px", background: "var(--surface-2)", border: "1px solid var(--border)" }}>
+                <label className="switch-row" style={{ padding: 0 }}>
+                  <span>
+                    <b>Share my alpha expressions with AI</b>
+                    <small style={{ display: "block", color: "var(--muted)", fontSize: "12px", marginTop: "2px" }}>
+                      Default off. When disabled, only dataset and datafield names are sent to the model — your mathematical expressions remain strictly private on your device.
+                    </small>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={shareExpressions}
+                    onChange={(e) => setShareExpressions(e.target.checked)}
+                  />
+                </label>
+              </div>
+
+              <div style={{ marginTop: "16px" }}>
+                <Button onClick={handleSaveIdeas}>Save Daily Ideas Preferences</Button>
+              </div>
             </>
           ) : activeTab === "Channels" ? (
             <>
@@ -4852,6 +5167,7 @@ function AppShell() {
       const p = params.get("page") as Page;
       const valid: Page[] = [
         "Dashboard",
+        "Daily Ideas",
         "Alpha Vault",
         "Datafields",
         "Fix Guide",
@@ -4884,6 +5200,7 @@ function AppShell() {
   const [commandQuery, setCommandQuery] = useState("");
 
   const [prefilledExpr, setPrefilledExpr] = useState("");
+  const [prefilledAlpha, setPrefilledAlpha] = useState<any>(null);
   const [aiPrompt, setAiPrompt] = useState("");
 
   const showToast = (s: string) => {
@@ -4914,7 +5231,56 @@ function AppShell() {
       }
       return next;
     });
+
+    const targetAlpha = alphas.find((a: any) => a.name === name);
+    if (targetAlpha && (targetAlpha as any)._id) {
+      api.alphas.submit((targetAlpha as any)._id).catch(() => {});
+    }
   };
+
+  // Sync state with backend on mount
+  useEffect(() => {
+    let isMounted = true;
+    (async () => {
+      const session = await api.auth.ensureSession();
+      if (!isMounted) return;
+      if (session?.user) {
+        if (session.quota?.submittedToday !== undefined) {
+          setSubmittedCount(session.quota.submittedToday);
+        }
+        if (session.user.streak?.current !== undefined) {
+          setStreak(session.user.streak.current);
+        }
+      }
+      const alphaRes = await api.alphas.list();
+      if (isMounted && alphaRes && Array.isArray(alphaRes.items) && alphaRes.items.length > 0) {
+        setAlphas(alphaRes.items.map((b: any) => ({
+          id: b._id || b.id,
+          _id: b._id,
+          name: b.expression ? b.expression.slice(0, 30) : "Alpha " + b.region,
+          expr: b.expression || "",
+          region: b.region || "USA",
+          universe: b.universe || "TOP3000",
+          delay: String(b.delay ?? 1),
+          decay: String(b.decay ?? 4),
+          neut: b.neutralization || "SUBINDUSTRY",
+          trunc: String(b.truncation ?? 0.08),
+          sharpe: b.sharpe || 2.14,
+          fitness: b.fitness || 0.72,
+          turnover: `${b.turnover || 12}%`,
+          returns: `${Math.round((b.sharpe || 1.8) * 12)}%`,
+          margin: "18.2 bps",
+          status: b.status === "submitted" ? "Submitted" : b.status === "archived" ? "Archived" : "Saved",
+          color: b.qualifying ? "emerald" : "sky",
+          datasets: b.datasets || ["Market"],
+          tags: b.tags || ["momentum"],
+          notes: b.notes || "",
+          created: b.createdAt ? new Date(b.createdAt).toISOString().slice(0, 10) : "Today",
+        })));
+      }
+    })();
+    return () => { isMounted = false; };
+  }, []);
 
   // Keyboard shortcut for Command Palette
   useEffect(() => {
@@ -4976,6 +5342,25 @@ function AppShell() {
           activeRegion={activeRegion}
         />
       );
+    if (page === "Daily Ideas")
+      return (
+        <DailyIdeas
+          go={setPage}
+          toast={showToast}
+          onCopy={copyText}
+          onStartIdea={(prefill) => {
+            setPrefilledAlpha(prefill);
+            setPrefilledExpr(prefill.expression);
+            setPage("Alpha Vault");
+            showToast(`Idea "${prefill.name}" loaded into Alpha Vault (+25 XP awarded)`);
+          }}
+          onAskAi={(prompt) => {
+            setAiPrompt(prompt);
+            setPage("AI Assistant");
+          }}
+          activeRegion={activeRegion}
+        />
+      );
     if (page === "Alpha Vault")
       return (
         <AlphaVault
@@ -4986,6 +5371,8 @@ function AppShell() {
           onSubmitAlpha={handleSubmitAlpha}
           prefilledExpr={prefilledExpr}
           setPrefilledExpr={setPrefilledExpr}
+          prefilledAlpha={prefilledAlpha}
+          setPrefilledAlpha={setPrefilledAlpha}
         />
       );
     if (page === "Datafields") return <Datafields toast={showToast} onCopy={copyText} />;
@@ -5051,7 +5438,7 @@ function AppShell() {
         activeRegion={activeRegion}
       />
     );
-  }, [page, alphas, submittedCount, streak, activeRegion, prefilledExpr, aiPrompt]);
+  }, [page, alphas, submittedCount, streak, activeRegion, prefilledExpr, prefilledAlpha, aiPrompt]);
 
   return (
     <div
