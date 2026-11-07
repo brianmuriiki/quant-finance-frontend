@@ -1,0 +1,10 @@
+{
+  "description": "A productivity and analytics platform for WorldQuant BRAIN researchers to manage alphas, track datafield usage and progress, improve submissions, and monitor earnings.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
