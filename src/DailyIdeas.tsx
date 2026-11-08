@@ -117,136 +117,15 @@ export function DailyIdeas({
     setError(null);
     try {
       const res = await api.ideas.getToday();
-      if (res && res.ideas) {
+      if (res && res.ideas && res.ideas.length > 0) {
         setBatch(res.batch);
         setIdeas(res.ideas);
         setTodayStr(res.today || new Date().toISOString().slice(0, 10));
       } else {
-        // Fallback local mockup if backend is offline
-        const localToday = new Date().toISOString().slice(0, 10);
-        setTodayStr(localToday);
-        setBatch({
-          day: localToday,
-          status: "ready",
-          source: "rule_based",
-          regenerations: 0,
-          swaps: 0,
-        });
-        setIdeas([
-          {
-            _id: "idea_1",
-            order: 1,
-            slotType: "gap",
-            title: "EUR Delay-1 News Sentiment Momentum",
-            thesis: "News sentiment changes predict 1-day price drifts with low correlation to price momentum in European equities.",
-            region: "EUR",
-            delay: 1,
-            category: "news",
-            datasets: ["sentiment_feed_v1"],
-            datafields: ["headline_polarity", "news_volume"],
-            expressionSketch: "group_rank(ts_mean(headline_polarity, 3), sector) * (news_volume > 5)",
-            suggestedSettings: { universe: "EUR600", neutralization: "SECTOR", decay: 2, truncation: 0.08 },
-            reasons: ["EUR Delay-1 News cell in pyramid has zero submitted alphas", "headline_polarity is fresh in this region"],
-            correlationRisk: "low",
-            turnoverRisk: "medium",
-            difficulty: "easy",
-            estimatedMinutes: 15,
-            xpReward: 25,
-            status: "new",
-            outcome: "none",
-          },
-          {
-            _id: "idea_2",
-            order: 2,
-            slotType: "gap",
-            title: "USA Delay-1 Analyst Revisions Velocity",
-            thesis: "Sudden acceleration in consensus target revisions signals institutional buying pressure before earnings announcement.",
-            region: "USA",
-            delay: 1,
-            category: "analyst",
-            datasets: ["analyst_revisions_ibes"],
-            datafields: ["target_mean", "target_std"],
-            expressionSketch: "ts_delta(target_mean, 5) / (target_std + 0.001)",
-            suggestedSettings: { universe: "TOP3000", neutralization: "SUBINDUSTRY", decay: 4, truncation: 0.08 },
-            reasons: ["Fills empty pyramid gap for USA Analyst Delay-1", "High fitness profile in historical backtests"],
-            correlationRisk: "low",
-            turnoverRisk: "low",
-            difficulty: "medium",
-            estimatedMinutes: 20,
-            xpReward: 25,
-            status: "new",
-            outcome: "none",
-          },
-          {
-            _id: "idea_3",
-            order: 3,
-            slotType: "improve",
-            title: "Fundamentals Accruals Quality Booster",
-            thesis: "Sloan accrual anomaly conditioned on free-cash-flow yield dramatically improves Sharpe of decaying accounting alphas.",
-            region: "USA",
-            delay: 1,
-            category: "fundamentals",
-            datasets: ["fundamental_compustat"],
-            datafields: ["net_income", "operating_cashflow", "total_assets"],
-            expressionSketch: "-rank((net_income - operating_cashflow) / total_assets)",
-            suggestedSettings: { universe: "TOP3000", neutralization: "INDUSTRY", decay: 10, truncation: 0.05 },
-            reasons: ["Your Fundamentals cell has submitted alphas that missed the 1.58 Sharpe qualification threshold", "High durability signal"],
-            correlationRisk: "medium",
-            turnoverRisk: "low",
-            difficulty: "medium",
-            estimatedMinutes: 25,
-            xpReward: 35,
-            status: "new",
-            outcome: "none",
-          },
-          {
-            _id: "idea_4",
-            order: 4,
-            slotType: "unused_dataset",
-            title: "Options Implied Volatility Surface Tilt",
-            thesis: "Skew between 30-day out-of-the-money put and call IV indicates retail hedging pressure and impending mean reversion.",
-            region: "USA",
-            delay: 1,
-            category: "options",
-            datasets: ["options_surface_cboe"],
-            datafields: ["iv_skew_30d", "call_put_volume_ratio"],
-            expressionSketch: "group_zscore(iv_skew_30d, sector) * rank(call_put_volume_ratio)",
-            suggestedSettings: { universe: "TOP1000", neutralization: "MARKET", decay: 1, truncation: 0.1 },
-            reasons: ["Dataset options_surface_cboe has 0 used fields in submitted alphas", "Orthogonal to all price-volume models"],
-            correlationRisk: "low",
-            turnoverRisk: "high",
-            difficulty: "hard",
-            estimatedMinutes: 30,
-            xpReward: 40,
-            status: "new",
-            outcome: "none",
-          },
-          {
-            _id: "idea_5",
-            order: 5,
-            slotType: "stretch",
-            title: "Cross-Category: Sentiment-Weighted Quality",
-            thesis: "Weighting high-ROE fundamental leaders by positive media buzz creates alpha with 30% lower turnover than pure sentiment.",
-            region: "USA",
-            delay: 1,
-            category: "fundamentals",
-            datasets: ["fundamental_compustat", "sentiment_feed_v1"],
-            datafields: ["roe", "headline_polarity"],
-            expressionSketch: "rank(roe) * rank(ts_mean(headline_polarity, 5))",
-            suggestedSettings: { universe: "TOP3000", neutralization: "SUBINDUSTRY", decay: 5, truncation: 0.08 },
-            reasons: ["Combines orthogonal Fundamentals + News categories", "Drives unique coverage score in BRAIN matrix"],
-            correlationRisk: "low",
-            turnoverRisk: "low",
-            difficulty: "hard",
-            estimatedMinutes: 25,
-            xpReward: 50,
-            status: "new",
-            outcome: "none",
-          },
-        ]);
+        setError("No daily ideas available from server. Click Regenerate to fetch your personalized ideas.");
       }
     } catch (err: any) {
-      setError(err?.message || "Failed to load ideas");
+      setError(err?.message || "Failed to load ideas from server");
     } finally {
       setLoading(false);
     }

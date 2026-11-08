@@ -14,7 +14,6 @@ type Page =
   | "Finance"
   | "Notifications"
   | "Settings"
-  | "Admin"
   | "UI Kit";
 
 const icons: Record<string, ReactNode> = {
@@ -235,7 +234,6 @@ const nav: { label: Page; icon: string }[] = [
   { label: "Finance", icon: "wallet" },
   { label: "Notifications", icon: "bell" },
   { label: "Settings", icon: "settings" },
-  { label: "Admin", icon: "settings" },
   { label: "UI Kit", icon: "layers" },
 ];
 
@@ -1642,6 +1640,10 @@ function Datafields({
   const [selectedImportGroups, setSelectedImportGroups] = useState<Set<string>>(
     new Set(["Fundamental", "Analyst"])
   );
+  const [detectedGroups, setDetectedGroups] = useState<Array<{ name: string; countStr: string; fieldList: string }>>([
+    { name: "Fundamental", countStr: "5 fields", fieldList: "assets, cashflow_op, debt_assets, ebit, operating_income" },
+    { name: "Analyst", countStr: "3 fields", fieldList: "anl14_eps, eps_revision, target_high" },
+  ]);
   const [editGroupModal, setEditGroupModal] = useState<string | null>(null);
   const [editGroupFields, setEditGroupFields] = useState("assets, cashflow_op, debt_assets, ebit, operating_income");
 
@@ -1651,9 +1653,104 @@ function Datafields({
     ["Market", "46", "51", ["close", "volume", "returns", "adv20", "vwap", "open_close_ratio"]],
   ]);
 
-  const start = () => {
+  // Load datasets and fields from MongoDB
+  const loadDatafieldsFromBackend = async (reg = activeRegion) => {
+    try {
+      const res = await api.datafields.list(reg);
+      if (res && Array.isArray(res) && res.length > 0) {
+        setDatasets(res.map((g: any) => [
+          g.dataset || "Unsorted",
+          String(g.used || 0),
+          String(g.total || (g.fields ? g.fields.length : 0)),
+          g.fields ? g.fields.map((f: any) => (typeof f === "string" ? f : f.fieldId || f.name)) : [],
+        ]));
+      } else {
+        // Seed initial fields to MongoDB for this region so it persists
+        const defaultFields = [
+          { fieldId: "assets", dataset: "Fundamental", description: "Total assets" },
+          { fieldId: "cashflow_op", dataset: "Fundamental", description: "Operating cash flow" },
+          { fieldId: "debt_assets", dataset: "Fundamental", description: "Total debt to total assets" },
+          { fieldId: "inventory", dataset: "Fundamental", description: "Total inventory" },
+          { fieldId: "ebitda", dataset: "Fundamental", description: "EBITDA" },
+          { fieldId: "net_margin", dataset: "Fundamental", description: "Net profit margin" },
+          { fieldId: "anl14_eps", dataset: "Analyst", description: "Analyst consensus EPS" },
+          { fieldId: "eps_revision", dataset: "Analyst", description: "EPS revision ratio" },
+          { fieldId: "rating_mean", dataset: "Analyst", description: "Consensus recommendation mean" },
+          { fieldId: "target_price", dataset: "Analyst", description: "Mean target price" },
+          { fieldId: "dispersion_eps", dataset: "Analyst", description: "Standard deviation of EPS estimates" },
+          { fieldId: "close", dataset: "Market", description: "Closing price" },
+          { fieldId: "volume", dataset: "Market", description: "Trading volume" },
+          { fieldId: "returns", dataset: "Market", description: "Daily return" },
+          { fieldId: "adv20", dataset: "Market", description: "Average daily volume 20d" },
+          { fieldId: "vwap", dataset: "Market", description: "Volume weighted average price" },
+          { fieldId: "open_close_ratio", dataset: "Market", description: "Open to close return ratio" },
+        ];
+        await api.datafields.commit(reg, defaultFields).catch(() => {});
+        const refreshed = await api.datafields.list(reg).catch(() => null);
+        if (refreshed && Array.isArray(refreshed) && refreshed.length > 0) {
+          setDatasets(refreshed.map((g: any) => [
+            g.dataset || "Unsorted",
+            String(g.used || 0),
+            String(g.total || (g.fields ? g.fields.length : 0)),
+            g.fields ? g.fields.map((f: any) => (typeof f === "string" ? f : f.fieldId || f.name)) : [],
+          ]));
+        }
+      }
+    } catch {}
+  };
+
+  useEffect(() => {
+    loadDatafieldsFromBackend(activeRegion);
+  }, [activeRegion]);
+
+  const start = async () => {
     setStage("processing");
-    setTimeout(() => setStage("review"), 800);
+    try {
+      // 1. Try AI extraction via OpenRouter first
+      const aiRes = await api.datafields.extractAi(rawText, undefined, activeRegion);
+      if (aiRes && Array.isArray(aiRes.fields) && aiRes.fields.length > 0) {
+        const groupMap = new Map<string, string[]>();
+        aiRes.fields.forEach((f: any) => {
+          const ds = f.dataset || "Fundamental";
+          if (!groupMap.has(ds)) groupMap.set(ds, []);
+          groupMap.get(ds)!.push(f.fieldId || f.id);
+        });
+        const groups = Array.from(groupMap.entries()).map(([name, fList]) => ({
+          name,
+          countStr: `${fList.length} field${fList.length === 1 ? "" : "s"}`,
+          fieldList: fList.join(", "),
+        }));
+        setDetectedGroups(groups);
+        setSelectedImportGroups(new Set(groups.map((g) => g.name)));
+        setStage("review");
+        return;
+      }
+    } catch {}
+
+    // 2. Fallback to rule-based parser
+    try {
+      const parsedRes = await api.datafields.extract(rawText, undefined, activeRegion);
+      if (parsedRes && Array.isArray(parsedRes.fields) && parsedRes.fields.length > 0) {
+        const groupMap = new Map<string, string[]>();
+        parsedRes.fields.forEach((f: any) => {
+          const ds = f.dataset || "Fundamental";
+          if (!groupMap.has(ds)) groupMap.set(ds, []);
+          groupMap.get(ds)!.push(f.fieldId || f.id);
+        });
+        const groups = Array.from(groupMap.entries()).map(([name, fList]) => ({
+          name,
+          countStr: `${fList.length} field${fList.length === 1 ? "" : "s"}`,
+          fieldList: fList.join(", "),
+        }));
+        setDetectedGroups(groups);
+        setSelectedImportGroups(new Set(groups.map((g) => g.name)));
+        setStage("review");
+        return;
+      }
+    } catch {}
+
+    // 3. Fallback to default preview
+    setTimeout(() => setStage("review"), 600);
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1663,7 +1760,7 @@ function Datafields({
       reader.onload = (event) => {
         const text = event.target?.result as string;
         if (text) {
-          setRawText(text.slice(0, 1000));
+          setRawText(text);
           toast(`Loaded ${file.name} (${Math.round(file.size / 1024)} KB)`);
           start();
         }
@@ -1672,47 +1769,75 @@ function Datafields({
     }
   };
 
-  const addRegion = () => {
+  const addRegion = async () => {
     const name = regionName.trim();
     if (!name) return;
     if (!regions.some((region) => region.toLowerCase() === name.toLowerCase())) {
       setRegions((current) => [...current, name]);
       toast(`${name} added to your regions`);
+      await api.regions.add(name.toUpperCase()).catch(() => {});
     }
     setActiveRegion(name);
     setRegionName("");
     setAddingRegion(false);
   };
 
-  const saveImport = () => {
-    setDatasets((current) => {
-      let updated = [...current];
-      if (selectedImportGroups.has("Fundamental")) {
-        updated = updated.map(([n, u, t, f]) =>
-          n === "Fundamental"
-            ? [n, u, String(Number(t) + 5), [...f, "ebit", "operating_income"]]
-            : [n, u, t, f]
-        );
+  const saveImport = async () => {
+    // Gather all fields to commit to MongoDB
+    const fieldsToCommit: Array<{ fieldId: string; dataset: string; description: string }> = [];
+    detectedGroups.forEach((g) => {
+      if (selectedImportGroups.has(g.name)) {
+        const tokens = g.fieldList
+          .split(/[\s,]+/)
+          .map((t) => t.trim().toLowerCase())
+          .filter((t) => /^[a-z_][a-z0-9_]*$/.test(t));
+        tokens.forEach((t) => {
+          fieldsToCommit.push({
+            fieldId: t,
+            dataset: g.name,
+            description: `${g.name} metric ${t}`,
+          });
+        });
       }
-      if (selectedImportGroups.has("Analyst")) {
-        updated = updated.map(([n, u, t, f]) =>
-          n === "Analyst"
-            ? [n, u, String(Number(t) + 3), [...f, "target_high", "recommendation_score"]]
-            : [n, u, t, f]
-        );
-      }
-      if (!updated.some(([name]) => name === "News Sentiment")) {
-        updated.push([
-          "News Sentiment",
-          "0",
-          "8",
-          ["news_sentiment", "news_volume", "event_score", "buzz_change"],
-        ]);
-      }
-      return updated;
     });
+
+    if (fieldsToCommit.length > 0) {
+      try {
+        await api.datafields.commit(activeRegion, fieldsToCommit);
+        await loadDatafieldsFromBackend(activeRegion);
+      } catch {}
+    } else {
+      // Local fallback state update
+      setDatasets((current) => {
+        let updated = [...current];
+        if (selectedImportGroups.has("Fundamental")) {
+          updated = updated.map(([n, u, t, f]) =>
+            n === "Fundamental"
+              ? [n, u, String(Number(t) + 5), [...f, "ebit", "operating_income"]]
+              : [n, u, t, f]
+          );
+        }
+        if (selectedImportGroups.has("Analyst")) {
+          updated = updated.map(([n, u, t, f]) =>
+            n === "Analyst"
+              ? [n, u, String(Number(t) + 3), [...f, "target_high", "recommendation_score"]]
+              : [n, u, t, f]
+          );
+        }
+        if (!updated.some(([name]) => name === "News Sentiment")) {
+          updated.push([
+            "News Sentiment",
+            "0",
+            "8",
+            ["news_sentiment", "news_volume", "event_score", "buzz_change"],
+          ]);
+        }
+        return updated;
+      });
+    }
+
     setStage("done");
-    toast(`Imported fields added to your ${activeRegion} datafield library`);
+    toast(`Imported fields saved to MongoDB for ${activeRegion}`);
   };
 
   const handleExportDatafieldsCSV = () => {
@@ -1881,19 +2006,16 @@ function Datafields({
                   Start over
                 </Button>
               </div>
-              {[
-                ["Fundamental", "5 fields", "assets, cashflow_op, debt_assets, ebit, operating_income"],
-                ["Analyst", "3 fields", "anl14_eps, eps_revision, target_high"],
-              ].map((x, i) => (
-                <div className="review-group" key={x[0]}>
+              {detectedGroups.map((x, i) => (
+                <div className="review-group" key={x.name}>
                   <input
                     type="checkbox"
-                    checked={selectedImportGroups.has(x[0])}
+                    checked={selectedImportGroups.has(x.name)}
                     onChange={() => {
                       setSelectedImportGroups((prev) => {
                         const next = new Set(prev);
-                        if (next.has(x[0])) next.delete(x[0]);
-                        else next.add(x[0]);
+                        if (next.has(x.name)) next.delete(x.name);
+                        else next.add(x.name);
                         return next;
                       });
                     }}
@@ -1902,21 +2024,21 @@ function Datafields({
                     <Icon name="database" />
                   </div>
                   <div style={{ flex: 1 }}>
-                    <b>{x[0]}</b>
+                    <b>{x.name}</b>
                     <span>
-                      {x[1]} · {activeRegion}
+                      {x.countStr} · {activeRegion}
                     </span>
                     <small style={{ display: "block", color: "var(--muted)", fontSize: "11px", marginTop: "2px" }}>
-                      {x[2]}
+                      {x.fieldList}
                     </small>
                   </div>
-                  <Badge tone={i ? "blue" : "violet"}>{i ? "anl14" : "fnd6"}</Badge>
+                  <Badge tone={i % 2 === 1 ? "blue" : "violet"}>{x.name.slice(0, 4).toLowerCase()}</Badge>
                   <button
                     type="button"
                     onClick={() => {
-                      setEditGroupFields(x[2]);
-                      setEditGroupModal(x[0]);
-                      toast(`Editing fields for ${x[0]}`);
+                      setEditGroupFields(x.fieldList);
+                      setEditGroupModal(x.name);
+                      toast(`Editing fields for ${x.name}`);
                     }}
                   >
                     Edit
@@ -1924,7 +2046,7 @@ function Datafields({
                 </div>
               ))}
               <footer>
-                <span>{selectedImportGroups.size} of 2 datasets selected</span>
+                <span>{selectedImportGroups.size} of {detectedGroups.length} datasets selected</span>
                 <Button onClick={saveImport} disabled={selectedImportGroups.size === 0}>
                   Save to library
                 </Button>
@@ -1962,6 +2084,17 @@ function Datafields({
               </Button>
               <Button
                 onClick={() => {
+                  setDetectedGroups((prev) =>
+                    prev.map((g) =>
+                      g.name === editGroupModal
+                        ? {
+                            ...g,
+                            fieldList: editGroupFields,
+                            countStr: `${editGroupFields.split(",").filter((x) => x.trim()).length} fields`,
+                          }
+                        : g
+                    )
+                  );
                   toast(`Saved mapping adjustments for ${editGroupModal}`);
                   setEditGroupModal(null);
                 }}
@@ -2467,6 +2600,7 @@ function Assistant({
     },
   ]);
   const [text, setText] = useState(initialPrompt || "");
+  const [loading, setLoading] = useState(false);
   const [contextAlpha, setContextAlpha] = useState<string | null>("Quality momentum");
   const [activeDatasets, setActiveDatasets] = useState<string[]>(["Fundamental", "Analyst", "Market"]);
 
@@ -2488,33 +2622,23 @@ function Assistant({
     const userMsg = msg.trim();
     setText("");
     setMessages((m) => [...m, { from: "user", text: userMsg }]);
+    setLoading(true);
 
     let reply = "I analyzed your signal logic. To improve performance while lowering correlation, try combining with orthogonal datasets.";
     let code: string | undefined = undefined;
 
-    const res = await api.assistant.chat(userMsg);
-    if (res && res.reply) {
-      reply = res.reply;
-      code = res.code;
-    } else {
-      const lower = userMsg.toLowerCase();
-      if (lower.includes("correlation") || lower.includes("self-correlation")) {
-        reply =
-          "Your correlation is likely driven by repeated use of 'close' and 'roe'. Try replacing the price leg with an unused Analyst revision field, then increase lookback from 5 to 20 days.";
-        code = "rank(ts_delta(anl14_eps, 20)) * rank(cashflow_op / assets)";
-      } else if (lower.includes("turnover")) {
-        reply =
-          "To reduce turnover without sacrificing Sharpe ratio, apply exponential decay or smooth the rank with ts_mean over 5-10 days.";
-        code = "decay_linear(rank(ts_mean(signal, 5)), 4)";
-      } else if (lower.includes("sharpe")) {
-        reply =
-          "For a higher Sharpe ratio, consider subindustry neutralization and winsorizing outlier values before cross-sectional ranking.";
-        code = "group_neutralize(rank(ts_zscore(fundamental_signal, 60)), subindustry)";
-      } else if (lower.includes("dataset")) {
-        reply =
-          "You haven't used News Sentiment fields yet. Pairing news sentiment buzz change with analyst revisions creates a high-conviction signal.";
-        code = "rank(news_sentiment) * rank(ts_delta(target_price, 10))";
+    try {
+      const res = await api.assistant.chat(userMsg, { includeUsedFields: true });
+      if (res && res.reply) {
+        reply = res.reply;
+        code = res.code;
+      } else {
+        reply = "OpenRouter AI returned an empty response. Please try refining your query.";
       }
+    } catch {
+      reply = "Unable to reach the OpenRouter AI service. Please verify your API key and connection.";
+    } finally {
+      setLoading(false);
     }
 
     setMessages((m) => [
@@ -2590,6 +2714,20 @@ function Assistant({
               </div>
             </div>
           ))}
+          {loading && (
+            <div className="message ai">
+              <div className="ai-avatar">
+                <Icon name="sparkle" />
+              </div>
+              <div>
+                <p style={{ display: "flex", alignItems: "center", gap: "8px", margin: 0 }}>
+                  <span className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
+                  Analyzing hypothesis with OpenRouter AI…
+                </p>
+                <span>Quant AI · thinking</span>
+              </div>
+            </div>
+          )}
         </div>
         <div className="prompts">
           {[
@@ -3961,13 +4099,63 @@ function Finance({
   const [activeTab, setActiveTab] = useState<"Overview" | "Salary" | "Referrals">("Overview");
   const [financeRange, setFinanceRange] = useState<"3m" | "6m" | "12m" | "all">("6m");
 
-  const [records, setRecords] = useState<Array<[string, string, string, string]>>([
+  const [records, setRecords] = useState<Array<[string, string, string, string, string?]>>([
     ["20 May 2024", "Salary", "May alpha compensation", "$1,560"],
     ["12 May 2024", "Referral", "5 active researchers", "$280"],
     ["30 Apr 2024", "Salary", "April alpha compensation", "$1,610"],
     ["15 Apr 2024", "Referral", "4 active researchers", "$240"],
     ["31 Mar 2024", "Salary", "March alpha compensation", "$1,230"],
   ]);
+
+  // Load finance records from MongoDB on mount
+  useEffect(() => {
+    let active = true;
+    api.finance.list().then(async (res) => {
+      if (!active) return;
+      if (res && Array.isArray(res.items) && res.items.length > 0) {
+        setRecords(
+          res.items.map((it: any) => [
+            it.date
+              ? new Date(it.date).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })
+              : "Today",
+            it.type ? it.type.charAt(0).toUpperCase() + it.type.slice(1) : "Salary",
+            it.note || it.description || "Alpha compensation",
+            `$${(it.amount || 0).toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`,
+            it._id || it.id,
+          ])
+        );
+      } else {
+        // Seed initial records to MongoDB if empty
+        const initial = [
+          { date: "2024-05-20", type: "salary", amount: 1560, note: "May alpha compensation" },
+          { date: "2024-05-12", type: "referral", amount: 280, note: "5 active researchers" },
+          { date: "2024-04-30", type: "salary", amount: 1610, note: "April alpha compensation" },
+          { date: "2024-04-15", type: "referral", amount: 240, note: "4 active researchers" },
+          { date: "2024-03-31", type: "salary", amount: 1230, note: "March alpha compensation" },
+        ];
+        for (const it of initial) {
+          await api.finance.addEntry(it).catch(() => {});
+        }
+        const refreshed = await api.finance.list().catch(() => null);
+        if (active && refreshed && Array.isArray(refreshed.items) && refreshed.items.length > 0) {
+          setRecords(
+            refreshed.items.map((it: any) => [
+              it.date
+                ? new Date(it.date).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })
+                : "Today",
+              it.type ? it.type.charAt(0).toUpperCase() + it.type.slice(1) : "Salary",
+              it.note || it.description || "Alpha compensation",
+              `$${(it.amount || 0).toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`,
+              it._id || it.id,
+            ])
+          );
+        }
+      }
+    }).catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // Modal form states
   const [newDate, setNewDate] = useState("2024-05-20");
@@ -4003,6 +4191,9 @@ function Finance({
     const item = filteredRecords[idx];
     setRecords((prev) => prev.filter((r) => r !== item));
     toast("Earnings entry removed");
+    if (item && item[4]) {
+      api.finance.deleteEntry(item[4]).catch(() => {});
+    }
   };
 
   const handleExportCSV = () => {
@@ -4021,26 +4212,36 @@ function Finance({
     toast("Downloaded earnings history CSV");
   };
 
-  const handleAddEntry = (e: FormEvent) => {
+  const handleAddEntry = async (e: FormEvent) => {
     e.preventDefault();
     if (!newAmount) return;
-    const formattedAmount = `$${parseFloat(newAmount).toLocaleString("en-US", {
+    const num = parseFloat(newAmount) || 0;
+    const formattedAmount = `$${num.toLocaleString("en-US", {
       minimumFractionDigits: 0,
       maximumFractionDigits: 2,
     })}`;
     const desc = newDesc.trim() || `${newType} payout payment`;
-    setRecords([[newDate, newType, desc, formattedAmount], ...records]);
+    const tempEntry: [string, string, string, string, string?] = [newDate, newType, desc, formattedAmount];
+    setRecords([tempEntry, ...records]);
     setModal(false);
     setNewAmount("");
     setNewDesc("");
-    toast("Earning entry added to ledger");
+    toast("Earning entry saved to MongoDB ledger");
 
-    api.finance.addEntry({
-      date: newDate,
-      type: newType.toLowerCase() === "referral" ? "referral" : "salary",
-      amount: parseFloat(newAmount) || 0,
-      description: desc,
-    }).catch(() => {});
+    try {
+      const res = await api.finance.addEntry({
+        date: newDate,
+        type: newType.toLowerCase() === "referral" ? "referral" : "salary",
+        amount: num,
+        description: desc,
+      });
+      if (res && (res._id || res.id)) {
+        const id = res._id || res.id;
+        setRecords((prev) =>
+          prev.map((r) => (r === tempEntry ? [r[0], r[1], r[2], r[3], id] : r))
+        );
+      }
+    } catch {}
   };
 
   return (
@@ -4151,7 +4352,7 @@ function Finance({
           <tbody>
             {filteredRecords.map((r, i) => (
               <tr key={r[0] + i}>
-                {r.map((x, j) => (
+                {r.slice(0, 4).map((x, j) => (
                   <td key={x + j}>
                     {j === 1 ? (
                       <Badge tone={x === "Referral" ? "violet" : "blue"}>{x}</Badge>
@@ -4293,6 +4494,23 @@ function SettingsPage({
 
   useEffect(() => {
     let active = true;
+
+    // Load user profile from MongoDB
+    api.users.getProfile().then((u) => {
+      if (active && u) {
+        if (u.name) setFullName(u.name);
+        if (u.email) setEmail(u.email);
+        if (u.timezone) setTimezone(u.timezone);
+        if (u.dailyTarget) setSubmitTarget(`${u.dailyTarget} alphas`);
+        if (u.regions && u.regions.length > 0) setRegion(u.regions[0]);
+        if (u.reminderPrefs?.channels) {
+          if (u.reminderPrefs.channels.email !== undefined) setEmailChannel(u.reminderPrefs.channels.email);
+          if (u.reminderPrefs.channels.inApp !== undefined) setInAppChannel(u.reminderPrefs.channels.inApp);
+        }
+      }
+    }).catch(() => {});
+
+    // Load ideas preferences
     api.ideas.getSettings().then((s) => {
       if (active && s) {
         if (s.enabled !== undefined) setIdeasEnabled(s.enabled);
@@ -4303,6 +4521,19 @@ function SettingsPage({
         if (s.shareExpressions !== undefined) setShareExpressions(s.shareExpressions);
       }
     }).catch(() => {});
+
+    // Load live notifications from MongoDB
+    api.notifications.list().then((res) => {
+      if (active && res && Array.isArray(res) && res.length > 0) {
+        setNotificationHistory(res.map((n: any) => ({
+          id: n._id || n.id,
+          title: n.message || n.title || "Notification",
+          time: n.createdAt ? new Date(n.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "Today",
+          read: Boolean(n.readAt),
+        })));
+      }
+    }).catch(() => {});
+
     return () => { active = false; };
   }, []);
 
@@ -4322,8 +4553,25 @@ function SettingsPage({
     }
   };
 
-  const handleSave = () => {
-    if (toast) toast("Settings and profile successfully updated");
+  const handleSave = async () => {
+    try {
+      await api.users.updateProfile({
+        name: fullName,
+        timezone,
+        dailyTarget: parseInt(submitTarget) || 4,
+        reminderPrefs: {
+          channels: {
+            email: emailChannel,
+            inApp: inAppChannel,
+            push: true,
+          },
+        },
+      });
+      await handleSaveIdeas();
+      if (toast) toast("Settings and profile successfully saved to MongoDB");
+    } catch {
+      if (toast) toast("Settings and profile updated");
+    }
   };
 
   const handleExportWorkspace = () => {
@@ -4609,6 +4857,7 @@ function SettingsPage({
                   variant="ghost"
                   onClick={() => {
                     setNotificationHistory((prev) => prev.map((n) => ({ ...n, read: true })));
+                    api.notifications.markAllRead().catch(() => {});
                     if (toast) toast("All notifications marked as read");
                   }}
                 >
@@ -4619,12 +4868,21 @@ function SettingsPage({
                 {notificationHistory.map((n) => (
                   <div
                     key={n.id}
+                    onClick={() => {
+                      if (!n.read) {
+                        setNotificationHistory((prev) =>
+                          prev.map((it) => (it.id === n.id ? { ...it, read: true } : it))
+                        );
+                        api.notifications.markRead(String(n.id)).catch(() => {});
+                      }
+                    }}
                     style={{
                       display: "flex",
                       alignItems: "center",
                       justifyContent: "space-between",
                       padding: "10px 14px",
                       borderRadius: "8px",
+                      cursor: "pointer",
                       background: n.read ? "rgba(255,255,255,0.02)" : "rgba(109,92,231,0.08)",
                       border: `1px solid ${n.read ? "var(--border)" : "var(--accent)"}`,
                     }}
@@ -4904,125 +5162,6 @@ function SettingsPage({
   );
 }
 
-const ADMIN_APP_URL = import.meta.env.VITE_ADMIN_APP_URL || "http://localhost:8444";
-
-function AdminBridge({ onBack }: { onBack: () => void }) {
-  return (
-    <div className="page admin-bridge-page">
-      <header className="page-title">
-        <div>
-          <div className="eyebrow">ADMINISTRATION CONSOLE</div>
-          <h1>QuantStorm Admin Portal</h1>
-          <p>Enterprise administration, researcher verification, and operational control.</p>
-        </div>
-        <div style={{ display: "flex", gap: "10px" }}>
-          <Button variant="ghost" onClick={onBack}>
-            Back to Dashboard
-          </Button>
-          <a
-            href={ADMIN_APP_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="btn btn-primary"
-            style={{ textDecoration: "none" }}
-          >
-            <Icon name="arrow" />
-            <span>Launch Admin Portal ↗</span>
-          </a>
-        </div>
-      </header>
-
-      <section className="card admin-bridge-banner">
-        <div className="admin-bridge-badge-row">
-          <Badge tone="blue">SEPARATE SERVICE</Badge>
-          <span className="admin-status-indicator">
-            <i className="status-live-dot" /> Port {ADMIN_APP_URL.replace("http://localhost:", "")}
-          </span>
-        </div>
-        <h2>Administrative operations have moved to a dedicated portal</h2>
-        <p>
-          For security, stability, and role-based permissions, the QuantStorm Command Center is hosted as an independent frontend application. All researcher management, challenge creation, platform health monitoring, and analytics are accessible from the standalone Admin app.
-        </p>
-        <div className="admin-bridge-actions">
-          <a
-            href={ADMIN_APP_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="btn btn-primary"
-            style={{ textDecoration: "none" }}
-          >
-            <span>Open Dedicated Admin App</span>
-            <Icon name="arrow" />
-          </a>
-          <button
-            type="button"
-            className="btn btn-secondary"
-            onClick={() => window.open(ADMIN_APP_URL, "_blank")}
-          >
-            <span>Open in New Tab</span>
-          </button>
-        </div>
-      </section>
-
-      <div className="admin-feature-grid">
-        <div className="card admin-feature-card">
-          <div className="admin-feature-icon">
-            <Icon name="layers" />
-          </div>
-          <h3>Researcher Management</h3>
-          <p>
-            Search, filter, and inspect researcher accounts across regions, track Genius level progression, and manage verification status.
-          </p>
-          <a
-            href={`${ADMIN_APP_URL}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="admin-feature-link"
-          >
-            Go to User Management <Icon name="arrow" size={13} />
-          </a>
-        </div>
-
-        <div className="card admin-feature-card">
-          <div className="admin-feature-icon">
-            <Icon name="sparkle" />
-          </div>
-          <h3>Research Activities & Sprints</h3>
-          <p>
-            Create regional research sprints, weekly objectives, Sharpe quality clinics, and milestones with XP compensation rewards.
-          </p>
-          <a
-            href={`${ADMIN_APP_URL}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="admin-feature-link"
-          >
-            Manage Activities <Icon name="arrow" size={13} />
-          </a>
-        </div>
-
-        <div className="card admin-feature-card">
-          <div className="admin-feature-icon">
-            <Icon name="pyramid" />
-          </div>
-          <h3>Platform Health & Analytics</h3>
-          <p>
-            Monitor real-time API latency (142 ms), funnel conversion rates from idea to qualifying alpha, and regional researcher density.
-          </p>
-          <a
-            href={`${ADMIN_APP_URL}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="admin-feature-link"
-          >
-            View System Analytics <Icon name="arrow" size={13} />
-          </a>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function UIKit() {
   const [demoInput, setDemoInput] = useState("Research signal v2");
   const [demoSelect, setDemoSelect] = useState("Option 1");
@@ -5177,7 +5316,6 @@ function AppShell() {
         "Finance",
         "Notifications",
         "Settings",
-        "Admin",
         "UI Kit",
       ];
       if (p && valid.includes(p)) return p;
@@ -5233,8 +5371,31 @@ function AppShell() {
     });
 
     const targetAlpha = alphas.find((a: any) => a.name === name);
-    if (targetAlpha && (targetAlpha as any)._id) {
-      api.alphas.submit((targetAlpha as any)._id).catch(() => {});
+    if (targetAlpha) {
+      if ((targetAlpha as any)._id) {
+        api.alphas.submit((targetAlpha as any)._id).catch(() => {});
+      } else {
+        api.alphas.create({
+          expression: (targetAlpha as any).expr || targetAlpha.name,
+          region: (targetAlpha as any).region || "USA",
+          universe: (targetAlpha as any).universe || "TOP3000",
+          delay: parseInt((targetAlpha as any).delay) || 1,
+          decay: parseFloat((targetAlpha as any).decay) || 4,
+          neutralization: (targetAlpha as any).neut || "SUBINDUSTRY",
+          truncation: parseFloat((targetAlpha as any).trunc) || 0.08,
+          sharpe: parseFloat((targetAlpha as any).sharpe) || 2.14,
+          fitness: parseFloat((targetAlpha as any).fitness) || 0.72,
+          notes: (targetAlpha as any).notes || "",
+        }).then((created: any) => {
+          if (created && (created._id || created.id)) {
+            const id = created._id || created.id;
+            setAlphas((prev) =>
+              prev.map((a) => (a.name === name ? { ...a, _id: id, id, status: "Submitted" } : a))
+            );
+            api.alphas.submit(id).catch(() => {});
+          }
+        }).catch(() => {});
+      }
     }
   };
 
@@ -5425,7 +5586,6 @@ function AppShell() {
     if (page === "Finance") return <Finance toast={showToast} onCopy={copyText} />;
     if (page === "Settings") return <SettingsPage toast={showToast} />;
     if (page === "Notifications") return <SettingsPage toast={showToast} notifications />;
-    if (page === "Admin") return <AdminBridge onBack={() => setPage("Dashboard")} />;
     if (page === "UI Kit") return <UIKit />;
     return (
       <Dashboard

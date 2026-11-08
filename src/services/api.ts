@@ -154,6 +154,12 @@ export const api = {
         body: JSON.stringify({ rawText, dataset, region }),
       });
     },
+    async extractAi(text: string, dataset?: string, region = "USA") {
+      return request<{ fields: any[]; rejected?: any[] }>("/datafields/import/ai", {
+        method: "POST",
+        body: JSON.stringify({ text, dataset, region }),
+      });
+    },
     async commit(region: string, fields: Array<{ fieldId: string; dataset?: string; description?: string }>) {
       return request<{ added: number; skippedExisting: number; datasets: number }>("/datafields/commit", {
         method: "POST",
@@ -225,8 +231,46 @@ export const api = {
         }),
       });
     },
+    async deleteEntry(id: string) {
+      return request<{ deleted: boolean }>(`/finance/${id}`, {
+        method: "DELETE",
+      });
+    },
     async summary() {
       return request<any>("/finance/summary");
+    },
+  },
+
+  regions: {
+    async list() {
+      return request<{ regions: Array<{ code: string; alphaCount: number; datafieldCount: number; datasetCount: number }>; suggested: string[] }>("/regions");
+    },
+    async add(code: string) {
+      return request<any>("/regions", {
+        method: "POST",
+        body: JSON.stringify({ code }),
+      });
+    },
+    async delete(code: string, force = false) {
+      return request<any>(`/regions/${code}?force=${force}`, {
+        method: "DELETE",
+      });
+    },
+  },
+
+  notifications: {
+    async list() {
+      return request<any[]>("/notifications");
+    },
+    async markAllRead() {
+      return request<{ ok: boolean }>("/notifications/read-all", {
+        method: "POST",
+      });
+    },
+    async markRead(id: string) {
+      return request<{ ok: boolean }>(`/notifications/${id}/read`, {
+        method: "PATCH",
+      });
     },
   },
 
