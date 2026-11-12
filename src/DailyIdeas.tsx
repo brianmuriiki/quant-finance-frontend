@@ -68,16 +68,18 @@ export function DailyIdeas({
   const [todayStr, setTodayStr] = useState<string>("");
   const [historyItems, setHistoryItems] = useState<IdeaItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [knownRegions, setKnownRegions] = useState<string[]>([activeRegion]);
   const [stats, setStats] = useState<{
     triedThisWeek: number;
     tryRatePct: number;
     submittedRatePct: number;
     qualifyingRatePct: number;
   }>({
-    triedThisWeek: 3,
-    tryRatePct: 60,
-    submittedRatePct: 66.7,
-    qualifyingRatePct: 33.3,
+    triedThisWeek: 0,
+    tryRatePct: 0,
+    submittedRatePct: 0,
+    qualifyingRatePct: 0,
   });
 
   // Action states
@@ -147,12 +149,12 @@ export function DailyIdeas({
 
   const fetchHistory = async () => {
     setHistoryLoading(true);
+    setHistoryError("");
     try {
       const res = await api.ideas.list({ limit: 50 });
-      if (res && res.data) {
-        setHistoryItems(res.data);
-      }
-    } catch {
+      setHistoryItems(Array.isArray(res) ? res : Array.isArray(res?.data) ? res.data : []);
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : "Could not load idea history");
     } finally {
       setHistoryLoading(false);
     }
@@ -161,6 +163,7 @@ export function DailyIdeas({
   useEffect(() => {
     fetchToday();
     fetchStats();
+    api.regions.list().then((res) => setKnownRegions(res.regions.map((region) => region.code))).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -183,31 +186,10 @@ export function DailyIdeas({
     try {
       toast(`Starting "${idea.title}"...`);
       const res = await api.ideas.start(idea._id);
-      if (res && res.prefill) {
-        setIdeas((prev) =>
-          prev.map((i) => (i._id === idea._id ? { ...i, status: "started", outcome: "tried" } : i))
-        );
-        onStartIdea(res.prefill);
-      } else {
-        // Fallback local start
-        setIdeas((prev) =>
-          prev.map((i) => (i._id === idea._id ? { ...i, status: "started", outcome: "tried" } : i))
-        );
-        onStartIdea({
-          ideaId: idea._id,
-          name: idea.title,
-          expression: idea.expressionSketch,
-          region: idea.region,
-          delay: idea.delay,
-          universe: idea.suggestedSettings?.universe || "TOP3000",
-          decay: idea.suggestedSettings?.decay || 4,
-          neutralization: idea.suggestedSettings?.neutralization || "SUBINDUSTRY",
-          truncation: idea.suggestedSettings?.truncation || 0.08,
-          datafields: idea.datafields,
-          datasets: idea.datasets,
-          notes: `Generated from Daily Idea: ${idea.title}. Thesis: ${idea.thesis}`,
-        });
-      }
+      setIdeas((prev) =>
+        prev.map((i) => (i._id === idea._id ? { ...i, status: "started", outcome: "tried" } : i))
+      );
+      onStartIdea(res.prefill);
       fetchStats();
     } catch (err: any) {
       toast(`Failed to start idea: ${err.message}`);
@@ -789,7 +771,7 @@ How can I refine this formula to maximize Sharpe ratio and minimize turnover/cor
                         type="button"
                         className="btn btn-ghost"
                         style={{ fontSize: "12px", padding: "6px 8px" }}
-                        disabled={swappingId === idea._id || (batch && batch.swaps >= 2)}
+                        disabled={swappingId === idea._id || Boolean(batch && batch.swaps >= 2)}
                         onClick={() => handleSwap(idea)}
                         title={batch && batch.swaps >= 2 ? "Swap limit reached for today" : "Swap with alternative idea"}
                       >
@@ -895,9 +877,7 @@ How can I refine this formula to maximize Sharpe ratio and minimize turnover/cor
               style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "8px", padding: "6px 12px", fontSize: "12.5px" }}
             >
               <option value="All">All Regions</option>
-              <option value="USA">USA</option>
-              <option value="EUR">EUR</option>
-              <option value="ASI">ASI</option>
+              {[...new Set([...knownRegions, ...historyItems.map((idea) => idea.region)])].filter(Boolean).map((region) => <option key={region} value={region}>{region}</option>)}
             </select>
 
             <select
@@ -928,6 +908,8 @@ How can I refine this formula to maximize Sharpe ratio and minimize turnover/cor
 
           {historyLoading ? (
             <div style={{ textAlign: "center", padding: "30px", color: "var(--muted)" }}>Loading history...</div>
+          ) : historyError ? (
+            <div className="card" role="alert" style={{ padding: "30px", textAlign: "center", color: "var(--red)" }}>{historyError}<div><button type="button" className="btn btn-secondary" onClick={fetchHistory}>Retry</button></div></div>
           ) : filteredHistory.length === 0 ? (
             <div className="card" style={{ padding: "40px", textAlign: "center", color: "var(--muted)" }}>
               <div style={{ fontSize: "32px", marginBottom: "8px" }}>📜</div>

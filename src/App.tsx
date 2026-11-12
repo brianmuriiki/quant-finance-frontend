@@ -13,8 +13,20 @@ type Page =
   | "Pyramid"
   | "Finance"
   | "Notifications"
-  | "Settings"
-  | "UI Kit";
+  | "Settings";
+
+const csvCell = (value: unknown) => `"${String(value ?? "").replace(/"/g, '""')}"`;
+
+function vapidKeyBytes(encodedKey: string): ArrayBuffer {
+  const padding = "=".repeat((4 - (encodedKey.length % 4)) % 4);
+  const base64 = (encodedKey + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = window.atob(base64);
+  const bytes = new Uint8Array(raw.length);
+  for (let index = 0; index < raw.length; index += 1) bytes[index] = raw.charCodeAt(index);
+  const buffer = new ArrayBuffer(bytes.length);
+  new Uint8Array(buffer).set(bytes);
+  return buffer;
+}
 
 const icons: Record<string, ReactNode> = {
   grid: (
@@ -145,6 +157,7 @@ const icons: Record<string, ReactNode> = {
       <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
     </>
   ),
+  lock: <><rect x="4" y="10" width="16" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></>,
   fileText: (
     <>
       <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
@@ -234,290 +247,206 @@ const nav: { label: Page; icon: string }[] = [
   { label: "Finance", icon: "wallet" },
   { label: "Notifications", icon: "bell" },
   { label: "Settings", icon: "settings" },
-  { label: "UI Kit", icon: "layers" },
 ];
 
+type AuthMode = "signin" | "signup" | "forgot" | "reset" | "verify" | "invite";
+
+function initialAuthMode(): AuthMode {
+  const path = window.location.pathname.replace(/\/+$/, "");
+  if (path.endsWith("/reset-password")) return "reset";
+  if (path.endsWith("/verify-email")) return "verify";
+  if (path.endsWith("/accept-invite")) return "invite";
+  return "signin";
+}
+
 function Auth({ onDone }: { onDone: () => void }) {
-  const [mode, setMode] = useState<"signin" | "signup" | "forgot" | "onboard">("signin");
-  const [step, setStep] = useState(1);
-  const [dailyTarget, setDailyTarget] = useState(4);
-  const [selectedRegions, setSelectedRegions] = useState<string[]>(["USA", "Europe"]);
-  const [reminders, setReminders] = useState(true);
-  const [selectedLevel, setSelectedLevel] = useState(1);
+  const [mode, setMode] = useState<AuthMode>(initialAuthMode);
+  const [flowToken] = useState(() => new URLSearchParams(window.location.search).get("token") || "");
+  const [referralCode] = useState(() => new URLSearchParams(window.location.search).get("ref") || new URLSearchParams(window.location.search).get("referralCode") || "");
+  const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [passwordConfirm, setPasswordConfirm] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [resetSent, setResetSent] = useState(false);
+  const [googleOAuthEnabled, setGoogleOAuthEnabled] = useState(false);
+  const [verificationStatus, setVerificationStatus] = useState<"pending" | "success" | "error">("pending");
+  const [authSuccess, setAuthSuccess] = useState("");
+  const [authError, setAuthError] = useState(() => {
+    const reason = new URLSearchParams(window.location.search).get("oauth_error");
+    const errors: Record<string, string> = {
+      oauth_cancelled: "Google sign-in was cancelled.",
+      oauth_invalid_state: "The Google sign-in session expired. Please try again.",
+      google_unconfigured: "Google sign-in is not configured on this server yet.",
+      registration_closed: "New account registration is currently closed.",
+      account_suspended: "This account is suspended.",
+      oauth_failed: "Google sign-in could not be completed. Please try again.",
+    };
+    return reason ? errors[reason] || "Google sign-in could not be completed." : "";
+  });
 
-  const toggleRegion = (r: string) => {
-    setSelectedRegions((prev) =>
-      prev.includes(r) ? (prev.length > 1 ? prev.filter((x) => x !== r) : prev) : [...prev, r]
-    );
-  };
+  useEffect(() => {
+    if (mode === "signin" || mode === "signup") {
+      api.auth.providers().then((providers) => setGoogleOAuthEnabled(providers.google)).catch(() => {});
+    }
+    const url = new URL(window.location.href);
+    if (url.searchParams.has("oauth") || url.searchParams.has("oauth_error") || url.searchParams.has("token")) {
+      url.searchParams.delete("oauth");
+      url.searchParams.delete("oauth_error");
+      url.searchParams.delete("token");
+      window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+    if (mode === "verify") {
+      if (!flowToken) {
+        setVerificationStatus("error");
+        setAuthError("The verification link is missing its token.");
+      } else {
+        api.auth.verifyEmail(flowToken).then(() => setVerificationStatus("success")).catch((error) => {
+          setVerificationStatus("error");
+          setAuthError(error instanceof Error ? error.message : "This verification link is invalid or expired.");
+        });
+      }
+    }
+    if ((mode === "reset" || mode === "invite") && !flowToken) {
+      setAuthError("This account link is missing its token. Request a fresh link and try again.");
+    }
+  }, []);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (mode === "signup") {
-      api.auth.register("Researcher", email || "researcher@quantstorm.com", password || "password123").catch(() => {});
-      setMode("onboard");
-    } else if (mode === "signin") {
-      await api.auth.login(email || "researcher@quantstorm.com", password || "password123").catch(() => {});
-      onDone();
-    } else {
-      setResetSent(true);
+    setAuthError("");
+    setAuthSuccess("");
+    if ((mode === "signup" || mode === "reset" || mode === "invite") && password.length < 8) {
+      setAuthError("Use at least 8 characters for your password.");
+      return;
+    }
+    if ((mode === "reset" || mode === "invite" || mode === "signup") && password !== passwordConfirm) {
+      setAuthError("Your passwords don’t match.");
+      return;
+    }
+    setBusy(true);
+    try {
+      if (mode === "signup") {
+        await api.auth.register(fullName.trim(), email, password, Intl.DateTimeFormat().resolvedOptions().timeZone, referralCode);
+        onDone();
+      } else if (mode === "signin") {
+        await api.auth.login(email, password);
+        onDone();
+      } else if (mode === "forgot") {
+        await api.auth.forgotPassword(email);
+        setResetSent(true);
+      } else if (mode === "reset") {
+        await api.auth.resetPassword(flowToken, password);
+        setPassword("");
+        setPasswordConfirm("");
+        setMode("signin");
+        setAuthSuccess("Your password has been reset. Sign in with your new password.");
+      } else if (mode === "invite") {
+        await api.auth.acceptInvite(flowToken, fullName.trim(), password, Intl.DateTimeFormat().resolvedOptions().timeZone);
+        onDone();
+      }
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Unable to complete this request.");
+    } finally {
+      setBusy(false);
     }
   };
 
-  if (mode === "onboard")
-    return (
-      <div className="auth-shell">
-        <div className="auth-side">
-          <Logo />
-          <div className="auth-quote">
-            <Badge tone="violet">WELCOME TO QUANTSTORM</Badge>
-            <h1>
-              Make every alpha
-              <br />
-              count.
-            </h1>
-            <p>Turn daily research into a compounding system of ideas, learnings, and progress.</p>
-          </div>
-          <div className="auth-metric">
-            <span>Research momentum</span>
-            <strong>7 day streak</strong>
-            <div className="mini-bars">
-              {[4, 7, 5, 9, 8, 11, 13].map((h, i) => (
-                <i key={i} style={{ height: h * 3 }} />
-              ))}
-            </div>
-          </div>
-        </div>
-        <main className="onboard-panel">
-          <div className="stepper">
-            <span>Setup</span>
-            <div>
-              {[1, 2, 3].map((n) => (
-                <i className={n <= step ? "active" : ""} key={n} />
-              ))}
-            </div>
-            <b>{step} of 3</b>
-          </div>
-          {step === 1 && (
-            <section>
-              <div className="eyebrow">YOUR RESEARCH</div>
-              <h2>Where do you build?</h2>
-              <p>Select your default regions ({selectedRegions.length} selected). You can change these anytime.</p>
-              <div className="choice-grid">
-                {["USA", "Europe", "Asia Pacific", "China", "India", "Global"].map((x) => (
-                  <button
-                    type="button"
-                    className={`choice ${selectedRegions.includes(x) ? "selected" : ""}`}
-                    onClick={() => toggleRegion(x)}
-                    key={x}
-                  >
-                    <span>{x.slice(0, 2).toUpperCase()}</span>
-                    {x}
-                    <i>
-                      <Icon name="check" size={13} />
-                    </i>
-                  </button>
-                ))}
-              </div>
-            </section>
-          )}
-          {step === 2 && (
-            <section>
-              <div className="eyebrow">DAILY RHYTHM</div>
-              <h2>Set your daily target</h2>
-              <p>How many alphas do you aim to submit each day?</p>
-              <div className="target-number">
-                <button type="button" onClick={() => setDailyTarget((t) => Math.max(1, t - 1))}>−</button>
-                <strong>{dailyTarget}</strong>
-                <button type="button" onClick={() => setDailyTarget((t) => Math.min(10, t + 1))}>+</button>
-              </div>
-              <label className="switch-row">
-                <span>
-                  <b>End-of-day reminders</b>
-                  <small>Get a nudge 3h and 1h before cutoff</small>
-                </span>
-                <input
-                  type="checkbox"
-                  checked={reminders}
-                  onChange={(e) => setReminders(e.target.checked)}
-                />
-              </label>
-            </section>
-          )}
-          {step === 3 && (
-            <section>
-              <div className="eyebrow">YOUR JOURNEY</div>
-              <h2>Choose your Genius level</h2>
-              <p>We’ll personalize milestones and recommendations.</p>
-              <div className="level-list">
-                {["New researcher", "Apprentice", "Expert", "Master"].map((x, i) => (
-                  <button
-                    type="button"
-                    className={selectedLevel === i ? "selected" : ""}
-                    onClick={() => setSelectedLevel(i)}
-                    key={x}
-                  >
-                    <span>{i + 1}</span>
-                    <div>
-                      <b>{x}</b>
-                      <small>
-                        {
-                          [
-                            "Getting started",
-                            "Building consistency",
-                            "Scaling research",
-                            "Leading the field",
-                          ][i]
-                        }
-                      </small>
-                    </div>
-                    <Icon name="chevron" />
-                  </button>
-                ))}
-              </div>
-            </section>
-          )}
-          <footer>
-            <Button variant="ghost" onClick={() => setStep(Math.max(1, step - 1))}>
-              Back
-            </Button>
-            <Button icon="arrow" onClick={() => (step < 3 ? setStep(step + 1) : onDone())}>
-              {step < 3 ? "Continue" : "Open QuantStorm"}
-            </Button>
-          </footer>
-        </main>
-      </div>
-    );
+  const titles: Record<AuthMode, string> = {
+    signin: "Welcome back",
+    signup: "Create your account",
+    forgot: "Reset your password",
+    reset: "Choose a new password",
+    verify: "Verify your email",
+    invite: "Accept your invitation",
+  };
+  const descriptions: Record<AuthMode, string> = {
+    signin: "Sign in to pick up where your research left off.",
+    signup: "Build a workspace for clearer, more consistent research.",
+    forgot: "Enter the email address on your account and we’ll send a reset link.",
+    reset: "Choose a new password to secure your QuantStorm account.",
+    verify: "We’re checking your email verification link.",
+    invite: "Set up your researcher account to join the workspace.",
+  };
+  const usesPassword = mode === "signin" || mode === "signup" || mode === "reset" || mode === "invite";
+  const needsName = mode === "signup" || mode === "invite";
+  const needsEmail = mode === "signin" || mode === "signup" || mode === "forgot";
+  const needsConfirm = mode === "signup" || mode === "reset" || mode === "invite";
+
   return (
     <div className="auth-shell">
-      <div className="auth-side">
+      <aside className="auth-side">
         <Logo />
         <div className="auth-quote">
-          <Badge tone="violet">RESEARCH, COMPOUNDED</Badge>
-          <h1>
-            Your best signals
-            <br />
-            deserve a system.
-          </h1>
-          <p>Save every idea, avoid repeated fields, and build your way up the Genius pyramid.</p>
-        </div>
-        <div className="auth-metric">
-          <span>Today’s research</span>
-          <strong>6 alphas generated</strong>
-          <div className="mini-bars">
-            {[4, 7, 5, 9, 8, 11, 13].map((h, i) => (
-              <i key={i} style={{ height: h * 3 }} />
-            ))}
+          <span className="auth-kicker"><i /> A workspace for serious research</span>
+          <h1>Turn good ideas into <em>repeatable</em> research.</h1>
+          <p>Keep your expressions, datasets, and progress in one focused workspace.</p>
+          <div className="auth-feature-list">
+            <div><span className="auth-feature-icon"><Icon name="vault" size={17} /></span><span><b>Research vault</b><small>Save, refine, and submit your alpha ideas.</small></span></div>
+            <div><span className="auth-feature-icon"><Icon name="database" size={17} /></span><span><b>Your data library</b><small>Track fields and dataset coverage by region.</small></span></div>
+            <div><span className="auth-feature-icon"><Icon name="pyramid" size={17} /></span><span><b>Progress that compounds</b><small>See how your research practice develops.</small></span></div>
           </div>
         </div>
-      </div>
-      <main className="auth-form">
-        <div className="mobile-logo">
-          <Logo />
-        </div>
-        <div>
-          <div className="eyebrow">QUANTSTORM</div>
-          <h2>
-            {mode === "signin"
-              ? "Welcome back"
-              : mode === "signup"
-                ? "Create your workspace"
-                : "Reset password"}
-          </h2>
-          <p>
-            {mode === "forgot"
-              ? "We’ll send a reset link to your inbox."
-              : mode === "signin"
-                ? "Continue where your research left off."
-                : "Start building a smarter research practice."}
-          </p>
-        </div>
-        {mode !== "forgot" && (
-          <button type="button" className="google" onClick={onDone}>
-            <b>G</b>Continue with Google
-          </button>
-        )}
-        {mode !== "forgot" && (
-          <div className="divider">
-            <span>or continue with email</span>
+        <div className="auth-side-footer"><span><Icon name="check" size={14} /> Private workspace</span><span>Built for better research habits</span></div>
+      </aside>
+      <main className="auth-main">
+        <div className="auth-form">
+          <div className="mobile-logo"><Logo /></div>
+          <div className="auth-heading">
+            <div className="eyebrow">QUANTSTORM WORKSPACE</div>
+            <h2>{titles[mode]}</h2>
+            <p>{descriptions[mode]}</p>
           </div>
-        )}
-        {resetSent && mode === "forgot" ? (
-          <div className="success-inline" style={{ margin: "18px 0" }}>
-            <Icon name="check" />
-            <div>
-              <b>Reset instructions sent</b>
-              <p style={{ margin: "4px 0 0", fontSize: "12px" }}>
-                We sent a password recovery link to {email || "your email address"}.
-              </p>
+
+          {mode === "verify" ? (
+            <div className={`auth-result ${verificationStatus}`} aria-live="polite">
+              <span className="auth-result-icon"><Icon name={verificationStatus === "success" ? "check" : "bell"} size={19} /></span>
+              <div>
+                <b>{verificationStatus === "pending" ? "Verifying your email…" : verificationStatus === "success" ? "Email verified" : "Verification link expired"}</b>
+                <p>{verificationStatus === "pending" ? "This should only take a moment." : verificationStatus === "success" ? "Your email is confirmed. You can sign in now." : authError || "Request a fresh verification link from your account."}</p>
+              </div>
             </div>
-            <Button
-              variant="secondary"
-              onClick={() => {
-                setResetSent(false);
-                setMode("signin");
-              }}
-            >
-              Sign in
-            </Button>
-          </div>
-        ) : (
-          <form onSubmit={submit}>
-            <label>
-              Email address
-              <input
-                type="email"
-                placeholder="researcher@example.com"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                required
-              />
-            </label>
-            {mode !== "forgot" && (
-              <label>
-                Password
-                <div className="input-link">
-                  <input
-                    type="password"
-                    placeholder="At least 8 characters"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    required
-                  />
-                  <button type="button" onClick={() => setMode("forgot")}>
-                    Forgot?
-                  </button>
-                </div>
-              </label>
-            )}
-            <Button type="submit" icon="arrow">
-              {mode === "signin"
-                ? "Sign in"
-                : mode === "signup"
-                  ? "Create account"
-                  : "Send reset link"}
-            </Button>
-          </form>
-        )}
-        <p className="auth-switch">
-          {mode === "signin"
-            ? "New to QuantStorm?"
-            : mode === "signup"
-              ? "Already have an account?"
-              : "Remembered your password?"}{" "}
-          <button
-            type="button"
-            onClick={() => {
-              setResetSent(false);
-              setMode(mode === "signin" ? "signup" : "signin");
-            }}
-          >
-            {mode === "signin" ? "Create account" : "Sign in"}
-          </button>
-        </p>
+          ) : resetSent ? (
+            <div className="auth-result success" aria-live="polite">
+              <span className="auth-result-icon"><Icon name="check" size={19} /></span>
+              <div><b>Check your inbox</b><p>If an account exists for {email}, a password reset link is on its way.</p></div>
+            </div>
+          ) : (
+            <>
+              {(mode === "signin" || mode === "signup") && googleOAuthEnabled && (
+                <button type="button" className="google" disabled={busy} onClick={() => api.auth.startGoogleOAuth(referralCode)}>
+                  <span className="google-mark" aria-hidden="true">G</span><span>Continue with Google</span>
+                </button>
+              )}
+              {(mode === "signin" || mode === "signup") && googleOAuthEnabled && <div className="divider"><span>or continue with email</span></div>}
+
+              <form onSubmit={submit}>
+                {needsName && <label htmlFor="auth-name">Full name<input id="auth-name" autoComplete="name" type="text" placeholder="Your name" value={fullName} onChange={(event) => setFullName(event.target.value)} maxLength={80} required /></label>}
+                {needsEmail && <label htmlFor="auth-email">Email address<input id="auth-email" autoComplete="email" type="email" inputMode="email" placeholder="you@example.com" value={email} onChange={(event) => setEmail(event.target.value)} maxLength={254} required /></label>}
+                {usesPassword && <label htmlFor="auth-password">{mode === "reset" ? "New password" : "Password"}
+                  <div className="input-link auth-password-wrap">
+                    <input id="auth-password" autoComplete={mode === "signin" ? "current-password" : "new-password"} type={showPassword ? "text" : "password"} placeholder="At least 8 characters" value={password} onChange={(event) => setPassword(event.target.value)} minLength={mode === "signin" ? undefined : 8} maxLength={128} required />
+                    <button type="button" className="auth-password-toggle" aria-label={showPassword ? "Hide password" : "Show password"} onClick={() => setShowPassword((value) => !value)}>{showPassword ? "Hide" : "Show"}</button>
+                  </div>
+                  {mode === "signin" && <button type="button" className="auth-forgot-link" onClick={() => { setAuthError(""); setMode("forgot"); }}>Forgot password?</button>}
+                  {(mode === "signup" || mode === "invite") && <small className="auth-field-hint">Use at least 8 characters.</small>}
+                </label>}
+                {needsConfirm && <label htmlFor="auth-confirm">Confirm password<input id="auth-confirm" autoComplete="new-password" type={showPassword ? "text" : "password"} placeholder="Enter your password again" value={passwordConfirm} onChange={(event) => setPasswordConfirm(event.target.value)} minLength={8} maxLength={128} required /></label>}
+                {authError && <p role="alert" className="auth-error"><Icon name="x" size={15} />{authError}</p>}
+                {authSuccess && <p role="status" className="auth-success"><Icon name="check" size={15} />{authSuccess}</p>}
+                <Button type="submit" icon={busy ? undefined : "arrow"} disabled={busy || ((mode === "reset" || mode === "invite") && !flowToken)}>
+                  {busy ? "Please wait…" : mode === "signin" ? "Sign in" : mode === "signup" ? "Create account" : mode === "forgot" ? "Send reset link" : mode === "reset" ? "Save new password" : "Accept invitation"}
+                </Button>
+              </form>
+            </>
+          )}
+
+          {mode === "signin" && <p className="auth-switch">New to QuantStorm? <button type="button" onClick={() => { setAuthError(""); setAuthSuccess(""); setMode("signup"); }}>Create an account</button></p>}
+          {mode === "signup" && <p className="auth-switch">Already have an account? <button type="button" onClick={() => { setAuthError(""); setMode("signin"); }}>Sign in</button></p>}
+          {(mode === "forgot" || mode === "reset" || mode === "invite" || mode === "verify" || resetSent) && <p className="auth-switch"><button type="button" onClick={() => { setAuthError(""); setAuthSuccess(""); setResetSent(false); setMode("signin"); }}>Back to sign in</button></p>}
+          <div className="auth-privacy"><Icon name="lock" size={13} /> Your account is protected with encrypted sessions.</div>
+        </div>
       </main>
     </div>
   );
@@ -546,14 +475,25 @@ function Stat({
   );
 }
 
-function Bars() {
-  const data = [42, 65, 38, 76, 58, 86, 61];
+function Bars({ alphas }: { alphas: any[] }) {
+  const days = Array.from({ length: 7 }, (_, i) => {
+    const date = new Date();
+    date.setHours(0, 0, 0, 0);
+    date.setDate(date.getDate() - (6 - i));
+    return date;
+  });
+  const counts = days.map((day) => alphas.filter((alpha) => {
+    if (alpha.status !== "Submitted" || !alpha.submittedAt) return false;
+    const submitted = new Date(alpha.submittedAt);
+    return submitted.toDateString() === day.toDateString();
+  }).length);
+  const max = Math.max(1, ...counts);
   return (
     <div className="chart-bars">
-      {data.map((v, i) => (
+      {counts.map((v, i) => (
         <div key={i}>
-          <span style={{ height: `${v}%` }} className={i === 5 ? "hot" : ""} />
-          <small>{["M", "T", "W", "T", "F", "S", "S"][i]}</small>
+          <span style={{ height: `${Math.max(4, (v / max) * 100)}%` }} className={i === counts.length - 1 ? "hot" : ""} />
+          <small>{days[i].toLocaleDateString(undefined, { weekday: "short" }).slice(0, 1)}</small>
         </div>
       ))}
     </div>
@@ -568,27 +508,34 @@ function Dashboard({
   onCopy,
   submittedCount,
   activeRegion,
+  currentUser,
+  dailyTarget,
 }: {
   go: (p: Page) => void;
   toast: (s: string) => void;
   alphas: typeof alphaData;
-  onSubmitAlpha: (name: string) => void;
+  onSubmitAlpha: (id: string) => void;
   onCopy: (text: string, label: string) => void;
   submittedCount: number;
   activeRegion: string;
+  currentUser: any;
+  dailyTarget: number;
 }) {
-  const [trendRange, setTrendRange] = useState<"7 days" | "30 days" | "90 days" | "12 months">("30 days");
-  const readyAlphas = useMemo(() => alphas.filter((a) => a.status === "Ready"), [alphas]);
-  const pct = Math.min(100, Math.round((submittedCount / 4) * 100));
+  const readyAlphas = useMemo(() => alphas.filter((a) => a.status === "Saved"), [alphas]);
+  const submittedAlphas = useMemo(() => alphas.filter((a) => a.status === "Submitted"), [alphas]);
+  const usedFieldsCount = new Set(submittedAlphas.flatMap((a) => a.datafields || [])).size;
+  const pct = dailyTarget ? Math.min(100, Math.round((submittedCount / dailyTarget) * 100)) : 0;
 
   const [dashboardIdeas, setDashboardIdeas] = useState<any[]>([]);
   const [ideasTriedCount, setIdeasTriedCount] = useState(0);
+  const [ideasTotalCount, setIdeasTotalCount] = useState(0);
 
   useEffect(() => {
     let active = true;
     api.ideas.getToday().then((res) => {
       if (active && res && res.ideas) {
         setDashboardIdeas(res.ideas.slice(0, 3));
+        setIdeasTotalCount(res.ideas.length);
         const tried = res.ideas.filter((i: any) => i.status === "started" || i.outcome !== "none").length;
         setIdeasTriedCount(tried);
       }
@@ -596,40 +543,18 @@ function Dashboard({
     return () => { active = false; };
   }, []);
 
-  const trendConfig = {
-    "7 days": {
-      sharpe: "1.98",
-      fitness: "0.69",
-      dArea: "M0 145C60 135 110 110 190 95s120-40 220-65 100 15 190-30V160H0z",
-      dLine: "M0 145C60 135 110 110 190 95s120-40 220-65 100 15 190-30",
-    },
-    "30 days": {
-      sharpe: "1.84",
-      fitness: "0.62",
-      dArea: "M0 130C70 115 70 95 140 105s80-60 145-35 70 15 120-20 110-20 195-40V160H0z",
-      dLine: "M0 130C70 115 70 95 140 105s80-60 145-35 70 15 120-20 110-20 195-40",
-    },
-    "90 days": {
-      sharpe: "1.76",
-      fitness: "0.58",
-      dArea: "M0 140C80 130 140 120 230 110s110-35 170-45 110 20 200-55V160H0z",
-      dLine: "M0 140C80 130 140 120 230 110s110-35 170-45 110 20 200-55",
-    },
-    "12 months": {
-      sharpe: "1.69",
-      fitness: "0.54",
-      dArea: "M0 150C90 140 160 130 250 125s120-30 170-35 110 15 180-50V160H0z",
-      dLine: "M0 150C90 140 160 130 250 125s120-30 170-35 110 15 180-50",
-    },
-  }[trendRange];
+  const average = (key: string) => {
+    const values = submittedAlphas.map((alpha) => Number(alpha[key])).filter(Number.isFinite);
+    return values.length ? (values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2) : "—";
+  };
 
   return (
     <div className="page">
       <header className="page-title">
         <div>
-          <div className="eyebrow">MONDAY, 20 MAY · {activeRegion} REGION</div>
-          <h1>Good morning, Alex</h1>
-          <p>Your research pipeline is healthy. {readyAlphas.length} alphas are ready to submit.</p>
+          <div className="eyebrow">{new Date().toLocaleDateString()} · {activeRegion} REGION</div>
+          <h1>Welcome{currentUser?.name ? `, ${currentUser.name}` : ""}</h1>
+          <p>{readyAlphas.length} saved alphas are ready to submit.</p>
         </div>
         <Button icon="plus" onClick={() => go("Alpha Vault")}>
           Add alpha
@@ -638,14 +563,14 @@ function Dashboard({
       <section className="daily-banner">
         <div className="ring">
           <strong>{submittedCount}</strong>
-          <span>/ 4</span>
+          <span>/ {dailyTarget || "—"}</span>
         </div>
         <div>
-          <Badge tone={submittedCount >= 4 ? "green" : "violet"}>
-            {submittedCount >= 4 ? "TARGET ACHIEVED" : "DAILY SUBMISSION"}
+          <Badge tone={dailyTarget > 0 && submittedCount >= dailyTarget ? "green" : "violet"}>
+            {dailyTarget > 0 && submittedCount >= dailyTarget ? "TARGET ACHIEVED" : "DAILY SUBMISSION"}
           </Badge>
-          <h2>{submittedCount >= 4 ? "Daily submission target reached!" : "Halfway to today’s target"}</h2>
-          <p>6h 24m until the {activeRegion} submission window closes</p>
+          <h2>{dailyTarget > 0 && submittedCount >= dailyTarget ? "Daily submission target reached" : "Daily submissions"}</h2>
+          <p>Submission count uses your configured account timezone.</p>
         </div>
         <div className="daily-track">
           <span style={{ width: `${pct}%` }} />
@@ -659,10 +584,10 @@ function Dashboard({
         </Button>
       </section>
       <div className="stats-grid">
-        <Stat label="Saved for later" value={String(alphas.length)} delta="+5 this week" icon="vault" />
-        <Stat label="Submitted this week" value={String(16 + submittedCount)} delta={`${pct}% of target`} icon="check" />
-        <Stat label="Used datafields" value="142" delta="Across 12 datasets" icon="database" />
-        <Stat label="Current streak" value="7 days" delta="Personal best: 14" icon="sparkle" />
+        <Stat label="Saved for later" value={String(readyAlphas.length)} delta="In your vault" icon="vault" />
+        <Stat label="Submitted alphas" value={String(submittedAlphas.length)} delta={`${pct}% of daily target`} icon="check" />
+        <Stat label="Used datafields" value={String(usedFieldsCount)} delta="From submitted alphas" icon="database" />
+        <Stat label="Current streak" value={`${currentUser?.streak?.current || 0} days`} delta={`Personal best: ${currentUser?.streak?.best || 0}`} icon="sparkle" />
       </div>
       <div className="dash-grid">
         <section className="card ready-card">
@@ -671,18 +596,18 @@ function Dashboard({
               <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                 <h3>Today's ideas</h3>
                 <span className="badge badge-neutral" style={{ fontSize: "11px", fontWeight: "700" }}>
-                  {ideasTriedCount}/5 tried
+                  {ideasTriedCount}/{ideasTotalCount} tried
                 </span>
               </div>
               <p>Top personalized alpha hypotheses generated for your datasets</p>
             </div>
             <button type="button" onClick={() => go("Daily Ideas")}>
-              View all 5 <Icon name="arrow" size={15} />
+              View all {ideasTotalCount} <Icon name="arrow" size={15} />
             </button>
           </div>
           {dashboardIdeas.length === 0 ? (
             <div style={{ padding: "20px", textAlign: "center", color: "var(--muted)" }}>
-              <p style={{ margin: "0 0 8px 0" }}>5 personalized hypotheses are ready for exploration</p>
+              <p style={{ margin: "0 0 8px 0" }}>No ideas have been generated for today yet.</p>
               <Button variant="secondary" onClick={() => go("Daily Ideas")}>Explore Daily Ideas</Button>
             </div>
           ) : (
@@ -724,11 +649,11 @@ function Dashboard({
           </div>
           {readyAlphas.length === 0 ? (
             <div style={{ padding: "28px", textAlign: "center", color: "var(--muted)" }}>
-              All ready alphas have been submitted for today!
+              {alphas.some((alpha) => alpha.status === "Submitted") ? "No saved alphas are waiting to be submitted." : "No alphas in your vault yet. Save an expression to get started."}
             </div>
           ) : (
             readyAlphas.slice(0, 3).map((a, i) => (
-              <div className="alpha-row" key={a.name}>
+              <div className="alpha-row" key={a._id || a.id}>
                 <div className="alpha-rank">{i + 1}</div>
                 <div>
                   <b>{a.name}</b>
@@ -745,7 +670,7 @@ function Dashboard({
                 <Button variant="ghost" onClick={() => onCopy(a.expr, a.name)}>
                   Copy
                 </Button>
-                <Button variant="secondary" onClick={() => onSubmitAlpha(a.name)}>
+                <Button variant="secondary" onClick={() => onSubmitAlpha(a._id || a.id)}>
                   Submit
                 </Button>
               </div>
@@ -758,49 +683,33 @@ function Dashboard({
               <h3>Submission rhythm</h3>
               <p>Last 7 days</p>
             </div>
-            <Badge tone="green">+12%</Badge>
+            <Badge tone="neutral">7 day view</Badge>
           </div>
-          <Bars />
+          <Bars alphas={alphas} />
           <div className="chart-foot">
             <span>
               <i className="dot-violet" />
               Submitted
             </span>
-            <b>{24 + submittedCount} total</b>
+            <b>{submittedAlphas.length} total</b>
           </div>
         </section>
         <section className="card trend-card">
           <div className="card-head">
             <div>
               <h3>Alpha quality trend</h3>
-              <p>Median Sharpe and fitness ({trendRange})</p>
+              <p>Average from submitted alphas</p>
             </div>
-            <select
-              value={trendRange}
-              onChange={(e) => {
-                setTrendRange(e.target.value as any);
-                toast(`Trendline updated for ${e.target.value}`);
-              }}
-            >
-              <option value="7 days">7 days</option>
-              <option value="30 days">30 days</option>
-              <option value="90 days">90 days</option>
-              <option value="12 months">12 months</option>
-            </select>
+            <Badge tone="neutral">{submittedAlphas.length} records</Badge>
           </div>
-          <svg viewBox="0 0 600 160" preserveAspectRatio="none">
-            <path className="gridline" d="M0 40h600M0 80h600M0 120h600" />
-            <path className="area" d={trendConfig.dArea} />
-            <path className="line" d={trendConfig.dLine} />
-          </svg>
           <div className="chart-foot">
             <span>
               <i className="dot-violet" />
-              Sharpe {trendConfig.sharpe}
+              Sharpe {average("sharpe")}
             </span>
             <span>
               <i className="dot-blue" />
-              Fitness {trendConfig.fitness}
+              Fitness {average("fitness")}
             </span>
           </div>
         </section>
@@ -836,44 +745,12 @@ function Dashboard({
   );
 }
 
-const alphaData = [
-  {
-    name: "Quality momentum",
-    expr: "rank(ts_delta(close, 5)) * rank(roe)",
-    region: "USA",
-    sharpe: "2.14",
-    fit: "0.71",
-    status: "Ready",
-  },
-  {
-    name: "Analyst revision",
-    expr: "-rank(ts_zscore(anl14_eps, 20))",
-    region: "EUR",
-    sharpe: "1.92",
-    fit: "0.64",
-    status: "Saved",
-  },
-  {
-    name: "Low volatility value",
-    expr: "rank(bookvalue / cap) * -rank(stddev_30d)",
-    region: "USA",
-    sharpe: "1.81",
-    fit: "0.60",
-    status: "Submitted",
-  },
-  {
-    name: "Cashflow acceleration",
-    expr: "rank(ts_delta(cashflow_op, 4))",
-    region: "GLB",
-    sharpe: "1.67",
-    fit: "0.55",
-    status: "Saved",
-  },
-];
+const alphaData: any[] = [];
 
 function AlphaVault({
   toast,
   onCopy,
+  regions,
   alphas,
   setAlphas,
   onSubmitAlpha,
@@ -884,9 +761,10 @@ function AlphaVault({
 }: {
   toast: (s: string) => void;
   onCopy: (text: string, label: string) => void;
+  regions: string[];
   alphas: typeof alphaData;
   setAlphas: React.Dispatch<React.SetStateAction<typeof alphaData>>;
-  onSubmitAlpha: (name: string) => void;
+  onSubmitAlpha: (id: string) => void;
   prefilledExpr?: string;
   setPrefilledExpr?: (expr: string) => void;
   prefilledAlpha?: any;
@@ -894,6 +772,7 @@ function AlphaVault({
 }) {
   const [editor, setEditor] = useState(Boolean(prefilledExpr || prefilledAlpha));
   const [saved, setSaved] = useState(false);
+  const [savingAlpha, setSavingAlpha] = useState(false);
   const [view, setView] = useState<"table" | "cards">("table");
   const [selected, setSelected] = useState<number | null>(null);
 
@@ -902,21 +781,20 @@ function AlphaVault({
   const [statusFilter, setStatusFilter] = useState("All");
   const [sharpeFilter, setSharpeFilter] = useState("All");
   const [selectedNames, setSelectedNames] = useState<Set<string>>(new Set());
+  const [fieldWarnings, setFieldWarnings] = useState<any>(null);
 
   // New Alpha Form State
-  const [newName, setNewName] = useState("Quality momentum v2");
-  const [newExpr, setNewExpr] = useState(
-    prefilledExpr || "rank(ts_delta(close, 5)) * rank(roe) - rank(debt_assets)"
-  );
+  const [newName, setNewName] = useState("");
+  const [newExpr, setNewExpr] = useState(prefilledExpr || "");
   const [newRegion, setNewRegion] = useState("USA");
   const [newUniverse, setNewUniverse] = useState("TOP3000");
   const [newDelay, setNewDelay] = useState("1");
   const [newDecay, setNewDecay] = useState("4");
   const [newNeutralization, setNewNeutralization] = useState("SUBINDUSTRY");
   const [newTruncation, setNewTruncation] = useState("0.08");
-  const [newSharpe, setNewSharpe] = useState("2.14");
-  const [newFitness, setNewFitness] = useState("0.71");
-  const [newTurnover, setNewTurnover] = useState("12.8%");
+  const [newSharpe, setNewSharpe] = useState("");
+  const [newFitness, setNewFitness] = useState("");
+  const [newTurnover, setNewTurnover] = useState("");
   const [newNotes, setNewNotes] = useState("");
 
   useEffect(() => {
@@ -937,9 +815,25 @@ function AlphaVault({
     }
   }, [prefilledAlpha, prefilledExpr]);
 
+  useEffect(() => {
+    if (!regions.length) return;
+    if (!regions.includes(newRegion)) setNewRegion(regions[0]);
+  }, [regions]);
+
+  useEffect(() => {
+    if (!editor || !newExpr.trim()) { setFieldWarnings(null); return; }
+    let active = true;
+    const timer = window.setTimeout(() => {
+      api.alphas.checkFields(newExpr, newRegion).then((warnings) => {
+        if (active) setFieldWarnings(warnings);
+      }).catch(() => { if (active) setFieldWarnings(null); });
+    }, 450);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [editor, newExpr, newRegion]);
+
   const filteredAlphas = useMemo(() => {
     return alphas.filter((a) => {
-      const matchSearch = `${a.name} ${a.expr} ${a.region}`
+      const matchSearch = `${a.name} ${a.expr} ${a.region} ${a.notes || ""} ${(a.tags || []).join(" ")} ${(a.datasets || []).join(" ")} ${(a.datafields || []).join(" ")}`
         .toLowerCase()
         .includes(searchQuery.toLowerCase());
       const matchStatus = statusFilter === "All" || a.status === statusFilter;
@@ -957,111 +851,117 @@ function AlphaVault({
     });
   }, [alphas, searchQuery, statusFilter, regionFilter, sharpeFilter]);
 
-  const handleSaveAlpha = () => {
-    const created = {
+  const handleSaveAlpha = async () => {
+    if (!newExpr.trim()) { toast("Enter an expression before saving this alpha"); return; }
+    if (!newRegion) { toast("Choose a region before saving this alpha"); return; }
+    setSavingAlpha(true);
+    const draft = {
       name: newName.trim() || "Untitled Alpha",
       expr: newExpr.trim(),
       region: newRegion,
-      sharpe: newSharpe,
-      fit: newFitness,
-      status: "Ready",
     };
-    setAlphas([created, ...alphas]);
-    setSaved(true);
-    setEditor(false);
-    toast(`Alpha "${created.name}" saved to your vault`);
-    if (setPrefilledExpr) setPrefilledExpr("");
-    if (setPrefilledAlpha) setPrefilledAlpha(null);
-
-    // Sync with backend API (MongoDB)
-    api.alphas.create({
-      expression: created.expr,
-      region: created.region,
-      universe: newUniverse || "TOP3000",
-      delay: parseInt(newDelay) || 1,
-      decay: parseFloat(newDecay) || 4,
-      neutralization: newNeutralization || "SUBINDUSTRY",
-      truncation: parseFloat(newTruncation) || 0.08,
-      sharpe: parseFloat(newSharpe) || 2.14,
-      fitness: parseFloat(newFitness) || 0.72,
-      notes: newNotes || "",
-      ideaId: prefilledAlpha?.ideaId || undefined,
-    }).then((res: any) => {
-      if (res && (res._id || res.id)) {
-        const id = res._id || res.id;
-        setAlphas((prev) =>
-          prev.map((a) => (a.name === created.name && a.expr === created.expr ? { ...a, _id: id, id } : a))
-        );
-      }
-    }).catch(() => {});
-  };
-
-  const toggleSelectAll = () => {
-    if (selectedNames.size === filteredAlphas.length && filteredAlphas.length > 0) {
-      setSelectedNames(new Set());
-    } else {
-      setSelectedNames(new Set(filteredAlphas.map((a) => a.name)));
+    try {
+      const created: any = await api.alphas.create({
+        name: draft.name,
+        expression: draft.expr,
+        region: draft.region,
+        universe: newUniverse,
+        delay: Number(newDelay),
+        decay: Number(newDecay),
+        neutralization: newNeutralization,
+        truncation: Number(newTruncation),
+        ...(newSharpe !== "" && { sharpe: Number(newSharpe) }),
+        ...(newFitness !== "" && { fitness: Number(newFitness) }),
+        ...(newTurnover !== "" && { turnover: Number(newTurnover.replace("%", "")) }),
+        notes: newNotes,
+        ideaId: prefilledAlpha?.ideaId || undefined,
+      });
+      setAlphas((prev) => [{
+        _id: created._id,
+        id: created._id,
+        name: created.name || created.expression.slice(0, 30),
+        expr: created.expression,
+        region: created.region,
+        sharpe: created.sharpe,
+        fit: created.fitness,
+        status: created.status === "submitted" ? "Submitted" : "Saved",
+        datasets: created.datasets || [],
+        datafields: created.datafields || [],
+        tags: created.tags || [],
+        createdAt: created.createdAt,
+        submittedAt: created.submittedAt,
+      }, ...prev]);
+      setSaved(true);
+      setEditor(false);
+      toast(`Alpha saved to your vault`);
+      if (setPrefilledExpr) setPrefilledExpr("");
+      if (setPrefilledAlpha) setPrefilledAlpha(null);
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "Could not save alpha");
+    } finally {
+      setSavingAlpha(false);
     }
   };
 
-  const toggleSelectOne = (name: string) => {
-    setSelectedNames((prev) => {
-      const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
+  const toggleSelectAll = () => {
+    const visibleIds = filteredAlphas.map((a) => a._id || a.id).filter(Boolean);
+    setSelectedNames((current) => {
+      const next = new Set(current);
+      if (visibleIds.length && visibleIds.every((id) => next.has(id))) visibleIds.forEach((id) => next.delete(id));
+      else visibleIds.forEach((id) => next.add(id));
       return next;
     });
   };
 
-  const handleBatchMarkReady = () => {
-    const count = selectedNames.size;
-    const targetAlphas = alphas.filter((a) => selectedNames.has(a.name));
-    setAlphas((prev) =>
-      prev.map((a) => (selectedNames.has(a.name) ? { ...a, status: "Ready" } : a))
-    );
-    targetAlphas.forEach((a: any) => {
-      const id = a._id || a.id;
-      if (id) api.alphas.update(id, { status: "ready" }).catch(() => {});
+  const toggleSelectOne = (id: string) => {
+    setSelectedNames((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
     });
-    toast(`Marked ${count} alphas as Ready`);
-    setSelectedNames(new Set());
   };
 
-  const handleBatchMarkSubmitted = () => {
-    const count = selectedNames.size;
-    setAlphas((prev) =>
-      prev.map((a) => (selectedNames.has(a.name) ? { ...a, status: "Submitted" } : a))
-    );
-    selectedNames.forEach((n) => onSubmitAlpha(n));
-    toast(`Submitted ${count} alphas to simulation queue`);
-    setSelectedNames(new Set());
+  const handleBatchArchive = async () => {
+    const ids = alphas.filter((a) => selectedNames.has(a._id || a.id)).map((a) => a._id || a.id).filter(Boolean);
+    try {
+      const result = await api.alphas.bulk(ids, "archive");
+      setAlphas((prev) => prev.map((a) => selectedNames.has(a._id || a.id) ? { ...a, status: "Archived" } : a));
+      toast(`Archived ${result.count} alphas`);
+      setSelectedNames(new Set());
+    } catch (error) { toast(error instanceof Error ? error.message : "Could not archive alphas"); }
   };
 
-  const handleBatchDelete = () => {
-    const count = selectedNames.size;
-    const toDelete = alphas.filter((a) => selectedNames.has(a.name));
-    setAlphas((prev) => prev.filter((a) => !selectedNames.has(a.name)));
-    toDelete.forEach((a: any) => {
-      const id = a._id || a.id;
-      if (id) api.alphas.delete(id).catch(() => {});
-    });
-    toast(`Removed ${count} alphas from vault`);
-    setSelectedNames(new Set());
+  const handleBatchMarkSubmitted = async () => {
+    const ids = alphas.filter((a) => selectedNames.has(a._id || a.id)).map((a) => a._id || a.id).filter(Boolean);
+    try {
+      const result = await api.alphas.bulk(ids, "submit");
+      setAlphas((prev) => prev.map((a) => selectedNames.has(a._id || a.id) ? { ...a, status: "Submitted", submittedAt: new Date().toISOString() } : a));
+      toast(`Recorded ${result.count} submitted alphas`);
+      setSelectedNames(new Set());
+    } catch (error) { toast(error instanceof Error ? error.message : "Could not submit alphas"); }
+  };
+
+  const handleBatchDelete = async () => {
+    const ids = alphas.filter((a) => selectedNames.has(a._id || a.id)).map((a) => a._id || a.id).filter(Boolean);
+    try {
+      const result = await api.alphas.bulk(ids, "delete");
+      setAlphas((prev) => prev.filter((a) => !selectedNames.has(a._id || a.id)));
+      toast(`Deleted ${result.count} alphas`);
+      setSelectedNames(new Set());
+    } catch (error) { toast(error instanceof Error ? error.message : "Could not delete alphas"); }
   };
 
   const handleExportSelectedCSV = () => {
-    const items = alphas.filter((a) => selectedNames.has(a.name));
+    const items = alphas.filter((a) => selectedNames.has(a._id || a.id));
     const csvContent =
       "data:text/csv;charset=utf-8," +
       ["Name,Expression,Region,Sharpe,Fitness,Status"]
         .concat(
-          items.map(
-            (a) =>
-              `"${a.name}","${a.expr.replace(/"/g, '""')}","${a.region}","${a.sharpe}","${a.fit}","${a.status}"`
-          )
+          items.map((a) => [a.name, a.expr, a.region, a.sharpe, a.fit, a.status].map(csvCell).join(","))
         )
         .join("\n");
-    const encoded = encodeURI(csvContent);
+    const encoded = `data:text/csv;charset=utf-8,${encodeURIComponent(csvContent)}`;
     const link = document.createElement("a");
     link.setAttribute("href", encoded);
     link.setAttribute("download", `quantstorm-selected-alphas-${new Date().toISOString().slice(0, 10)}.csv`);
@@ -1076,13 +976,10 @@ function AlphaVault({
       "data:text/csv;charset=utf-8," +
       ["Name,Expression,Region,Sharpe,Fitness,Status"]
         .concat(
-          alphas.map(
-            (a) =>
-              `"${a.name}","${a.expr.replace(/"/g, '""')}","${a.region}","${a.sharpe}","${a.fit}","${a.status}"`
-          )
+          alphas.map((a) => [a.name, a.expr, a.region, a.sharpe, a.fit, a.status].map(csvCell).join(","))
         )
         .join("\n");
-    const encoded = encodeURI(csvContent);
+    const encoded = `data:text/csv;charset=utf-8,${encodeURIComponent(csvContent)}`;
     const link = document.createElement("a");
     link.setAttribute("href", encoded);
     link.setAttribute("download", `quantstorm-vault-alphas-${new Date().toISOString().slice(0, 10)}.csv`);
@@ -1139,28 +1036,16 @@ function AlphaVault({
               </button>
             </div>
           </label>
-          <div className="warning-panel">
-            <div>
-              <Icon name="bell" />
-            </div>
+          {newExpr.trim() && <div className="warning-panel">
+            <div><Icon name="bell" /></div>
             <section>
-              <b>2 datafields have been used before</b>
-              <p>Using repeated fields may increase self-correlation.</p>
-              <div>
-                <Badge tone="red">close · used in 8 alphas</Badge>
-                <Badge tone="red">roe · used in 3 alphas</Badge>
-              </div>
+              <b>{fieldWarnings?.detected?.length ? `${fieldWarnings.detected.length} datafield${fieldWarnings.detected.length === 1 ? "" : "s"} detected` : "Checking expression datafields…"}</b>
+              <p>{fieldWarnings?.note || "Overlap is estimated from your saved datafields; it is not the platform’s official self-correlation."}</p>
+              {fieldWarnings?.reusedFields?.length > 0 && <div>{fieldWarnings.reusedFields.map((field: string) => <Badge key={field} tone="amber">{field} · previously used</Badge>)}</div>}
+              {fieldWarnings?.freshFields?.length > 0 && <div>{fieldWarnings.freshFields.map((field: string) => <Badge key={field} tone="green">{field} · new</Badge>)}</div>}
             </section>
-            <button
-              type="button"
-              onClick={() => {
-                setSearchQuery("close");
-                toast("Filtered vault by repeated datafield: close");
-              }}
-            >
-              View related alphas
-            </button>
-          </div>
+            {fieldWarnings?.reusedFields?.length > 0 && <button type="button" onClick={() => { setSearchQuery(fieldWarnings.reusedFields[0]); toast(`Showing alphas that use ${fieldWarnings.reusedFields[0]}`); }}>View related alphas</button>}
+          </div>}
           <div className="form-grid">
             <label className="field">
               <span>Name</span>
@@ -1169,10 +1054,7 @@ function AlphaVault({
             <label className="field">
               <span>Region</span>
               <select value={newRegion} onChange={(e) => setNewRegion(e.target.value)}>
-                <option>USA</option>
-                <option>EUR</option>
-                <option>ASI</option>
-                <option>GLB</option>
+                {regions.map((code) => <option key={code}>{code}</option>)}
               </select>
             </label>
             <label className="field">
@@ -1205,15 +1087,15 @@ function AlphaVault({
               <input value={newTruncation} onChange={(e) => setNewTruncation(e.target.value)} />
             </label>
             <label className="field">
-              <span>Sharpe</span>
+              <span>Simulation Sharpe (optional)</span>
               <input value={newSharpe} onChange={(e) => setNewSharpe(e.target.value)} />
             </label>
             <label className="field">
-              <span>Fitness</span>
+              <span>Simulation fitness (optional)</span>
               <input value={newFitness} onChange={(e) => setNewFitness(e.target.value)} />
             </label>
             <label className="field">
-              <span>Turnover</span>
+              <span>Simulation turnover (optional)</span>
               <input value={newTurnover} onChange={(e) => setNewTurnover(e.target.value)} />
             </label>
           </div>
@@ -1229,7 +1111,7 @@ function AlphaVault({
             <Button variant="ghost" onClick={() => setEditor(false)}>
               Cancel
             </Button>
-            <Button onClick={handleSaveAlpha}>Save to vault</Button>
+            <Button onClick={handleSaveAlpha} disabled={savingAlpha}>{savingAlpha ? "Saving…" : "Save to vault"}</Button>
           </div>
         </section>
       )}
@@ -1257,16 +1139,13 @@ function AlphaVault({
         </div>
         <select value={regionFilter} onChange={(e) => setRegionFilter(e.target.value)}>
           <option value="All">All Regions</option>
-          <option value="USA">Region: USA</option>
-          <option value="EUR">Region: EUR</option>
-          <option value="ASI">Region: ASI</option>
-          <option value="GLB">Region: GLB</option>
+          {regions.map((code) => <option key={code} value={code}>Region: {code}</option>)}
         </select>
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
           <option value="All">All Statuses</option>
-          <option value="Ready">Ready</option>
           <option value="Saved">Saved</option>
           <option value="Submitted">Submitted</option>
+          <option value="Archived">Archived</option>
         </select>
         <select value={sharpeFilter} onChange={(e) => setSharpeFilter(e.target.value)}>
           <option value="All">All Sharpe</option>
@@ -1376,8 +1255,8 @@ function AlphaVault({
             <span style={{ fontSize: "13px", fontWeight: 600 }}>Apply action to selected alphas</span>
           </div>
           <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-            <Button variant="secondary" onClick={handleBatchMarkReady}>
-              Mark Ready
+            <Button variant="secondary" onClick={handleBatchArchive}>
+              Archive
             </Button>
             <Button variant="secondary" onClick={handleBatchMarkSubmitted}>
               Mark Submitted
@@ -1403,7 +1282,7 @@ function AlphaVault({
                 <th>
                   <input
                     type="checkbox"
-                    checked={filteredAlphas.length > 0 && selectedNames.size === filteredAlphas.length}
+                    checked={filteredAlphas.length > 0 && filteredAlphas.every((alpha) => selectedNames.has(alpha._id || alpha.id))}
                     onChange={toggleSelectAll}
                   />
                 </th>
@@ -1425,12 +1304,12 @@ function AlphaVault({
                 </tr>
               ) : (
                 filteredAlphas.map((a) => (
-                  <tr key={a.name} onClick={() => setSelected(alphas.findIndex((item) => item.name === a.name))}>
+                  <tr key={a._id || a.id} onClick={() => setSelected(alphas.findIndex((item) => (item._id || item.id) === (a._id || a.id)))}>
                     <td>
                       <input
                         type="checkbox"
-                        checked={selectedNames.has(a.name)}
-                        onChange={() => toggleSelectOne(a.name)}
+                        checked={selectedNames.has(a._id || a.id)}
+                        onChange={() => toggleSelectOne(a._id || a.id)}
                         onClick={(e) => e.stopPropagation()}
                       />
                     </td>
@@ -1460,7 +1339,7 @@ function AlphaVault({
                         {a.status}
                       </Badge>
                     </td>
-                    <td>Today</td>
+                    <td>{a.createdAt ? new Date(a.createdAt).toLocaleDateString() : "—"}</td>
                     <td>
                       <button
                         type="button"
@@ -1491,8 +1370,8 @@ function AlphaVault({
             <button
               type="button"
               className="card"
-              onClick={() => setSelected(alphas.findIndex((item) => item.name === a.name))}
-              key={a.name}
+              onClick={() => setSelected(alphas.findIndex((item) => (item._id || item.id) === (a._id || a.id)))}
+              key={a._id || a.id}
             >
               <div>
                 <Badge tone={a.status === "Submitted" ? "green" : "violet"}>{a.status}</Badge>
@@ -1521,7 +1400,7 @@ function AlphaVault({
               <div>
                 <Badge tone="violet">{selectedAlpha.status}</Badge>
                 <h2>{selectedAlpha.name}</h2>
-                <p>Updated today · {selectedAlpha.region} universe</p>
+                  <p>{selectedAlpha.createdAt ? `Created ${new Date(selectedAlpha.createdAt).toLocaleDateString()}` : ""} · {selectedAlpha.region} region</p>
               </div>
               <button type="button" className="icon-btn" onClick={() => setSelected(null)}>
                 <Icon name="x" />
@@ -1546,20 +1425,20 @@ function AlphaVault({
                 </div>
                 <div>
                   <span>Turnover</span>
-                  <b>12.8%</b>
+                  <b>{selectedAlpha.turnover ?? "—"}</b>
                 </div>
                 <div>
                   <span>Self-corr.</span>
-                  <b>0.42</b>
+                  <b>{selectedAlpha.selfCorrelation ?? "—"}</b>
                 </div>
               </div>
               <h3>Simulation settings</h3>
               {[
                 ["Region", selectedAlpha.region],
-                ["Universe", "TOP3000"],
-                ["Delay", "1"],
-                ["Decay", "4"],
-                ["Neutralization", "Subindustry"],
+                ["Universe", selectedAlpha.universe || "—"],
+                ["Delay", selectedAlpha.delay ?? "—"],
+                ["Decay", selectedAlpha.decay ?? "—"],
+                ["Neutralization", selectedAlpha.neutralization || "—"],
               ].map((x) => (
                 <div className="detail-row" key={x[0]}>
                   <span>{x[0]}</span>
@@ -1567,34 +1446,41 @@ function AlphaVault({
                 </div>
               ))}
               <h3>Datafields used</h3>
-              <div className="chips">
-                <Badge tone="red">close · used</Badge>
-                <Badge tone="red">roe · used</Badge>
-                <Badge>debt_assets</Badge>
-              </div>
+              <div className="chips">{(selectedAlpha.datafields || []).map((field: string) => <Badge key={field}>{field}</Badge>)}</div>
             </div>
             <footer>
               <Button
                 variant="danger"
-                onClick={() => {
-                  setAlphas((prev) => prev.filter((item) => item.name !== selectedAlpha.name));
-                  setSelected(null);
-                  toast(`Alpha "${selectedAlpha.name}" removed from vault`);
+                onClick={async () => {
+                  try {
+                    await api.alphas.delete(selectedAlpha._id);
+                    setAlphas((prev) => prev.filter((item) => item._id !== selectedAlpha._id));
+                    setSelected(null);
+                    toast("Alpha deleted from your vault");
+                  } catch (error) { toast(error instanceof Error ? error.message : "Could not delete alpha"); }
                 }}
               >
                 Delete
               </Button>
               <Button
                 variant="secondary"
-                onClick={() => {
-                  const copy = {
-                    ...selectedAlpha,
-                    name: `${selectedAlpha.name} (Copy)`,
-                    status: "Saved",
-                  };
-                  setAlphas((prev) => [copy, ...prev]);
-                  setSelected(null);
-                  toast(`Duplicated as "${copy.name}"`);
+                onClick={async () => {
+                  try {
+                    const copy = await api.alphas.create({
+                      name: `${selectedAlpha.name} (Copy)`,
+                      expression: selectedAlpha.expr,
+                      region: selectedAlpha.region,
+                      universe: selectedAlpha.universe,
+                      delay: Number(selectedAlpha.delay),
+                      decay: Number(selectedAlpha.decay),
+                      neutralization: selectedAlpha.neut,
+                      truncation: Number(selectedAlpha.trunc),
+                      notes: selectedAlpha.notes,
+                    });
+                    setAlphas((prev) => [{ ...selectedAlpha, _id: copy._id, id: copy._id, name: copy.name, status: "Saved", createdAt: copy.createdAt }, ...prev]);
+                    setSelected(null);
+                    toast(`Duplicated as "${copy.name}"`);
+                  } catch (error) { toast(error instanceof Error ? error.message : "Could not duplicate alpha"); }
                 }}
               >
                 Duplicate
@@ -1606,7 +1492,7 @@ function AlphaVault({
                       item.name === selectedAlpha.name ? { ...item, status: "Submitted" } : item
                     )
                   );
-                  onSubmitAlpha(selectedAlpha.name);
+                  onSubmitAlpha(selectedAlpha._id || selectedAlpha.id);
                   setSelected(null);
                 }}
               >
@@ -1628,101 +1514,90 @@ function Datafields({
   onCopy: (text: string, label: string) => void;
 }) {
   const [stage, setStage] = useState<"idle" | "processing" | "review" | "done">("idle");
-  const [regions, setRegions] = useState(["USA", "Europe", "Asia Pacific", "China", "India"]);
+  const [regions, setRegions] = useState<string[]>([]);
   const [activeRegion, setActiveRegion] = useState("USA");
   const [addingRegion, setAddingRegion] = useState(false);
   const [regionName, setRegionName] = useState("");
   const [filterQuery, setFilterQuery] = useState("");
-  const [rawText, setRawText] = useState(
-    "fnd6_assets\tTotal assets\nfnd6_cashflow_op\tOperating cash flow\nanl14_eps\tEPS estimate"
-  );
+  const [rawText, setRawText] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [selectedImportGroups, setSelectedImportGroups] = useState<Set<string>>(
-    new Set(["Fundamental", "Analyst"])
+    new Set<string>()
   );
-  const [detectedGroups, setDetectedGroups] = useState<Array<{ name: string; countStr: string; fieldList: string }>>([
-    { name: "Fundamental", countStr: "5 fields", fieldList: "assets, cashflow_op, debt_assets, ebit, operating_income" },
-    { name: "Analyst", countStr: "3 fields", fieldList: "anl14_eps, eps_revision, target_high" },
-  ]);
+  const [detectedGroups, setDetectedGroups] = useState<Array<{ name: string; countStr: string; fieldList: string }>>([]);
+  const [detectedFieldDetails, setDetectedFieldDetails] = useState<Array<{ fieldId: string; dataset: string; description: string }>>([]);
+  const [importError, setImportError] = useState("");
   const [editGroupModal, setEditGroupModal] = useState<string | null>(null);
-  const [editGroupFields, setEditGroupFields] = useState("assets, cashflow_op, debt_assets, ebit, operating_income");
+  const [editGroupFields, setEditGroupFields] = useState("");
 
-  const [datasets, setDatasets] = useState<Array<[string, string, string, string[]]>>([
-    ["Fundamental", "28", "64", ["assets", "cashflow_op", "debt_assets", "inventory", "ebitda", "net_margin"]],
-    ["Analyst", "12", "48", ["anl14_eps", "eps_revision", "rating_mean", "target_price", "dispersion_eps"]],
-    ["Market", "46", "51", ["close", "volume", "returns", "adv20", "vwap", "open_close_ratio"]],
-  ]);
+  const [datasets, setDatasets] = useState<Array<[string, string, string, string[]]>>([]);
+  const [freshDatasets, setFreshDatasets] = useState<any[]>([]);
 
   // Load datasets and fields from MongoDB
   const loadDatafieldsFromBackend = async (reg = activeRegion) => {
     try {
-      const res = await api.datafields.list(reg);
-      if (res && Array.isArray(res) && res.length > 0) {
+      const [res, regionData, fresh] = await Promise.all([api.datafields.list(reg), api.regions.list(), api.datafields.fresh(reg)]);
+      if (Array.isArray(res)) {
         setDatasets(res.map((g: any) => [
           g.dataset || "Unsorted",
           String(g.used || 0),
           String(g.total || (g.fields ? g.fields.length : 0)),
           g.fields ? g.fields.map((f: any) => (typeof f === "string" ? f : f.fieldId || f.name)) : [],
         ]));
-      } else {
-        // Seed initial fields to MongoDB for this region so it persists
-        const defaultFields = [
-          { fieldId: "assets", dataset: "Fundamental", description: "Total assets" },
-          { fieldId: "cashflow_op", dataset: "Fundamental", description: "Operating cash flow" },
-          { fieldId: "debt_assets", dataset: "Fundamental", description: "Total debt to total assets" },
-          { fieldId: "inventory", dataset: "Fundamental", description: "Total inventory" },
-          { fieldId: "ebitda", dataset: "Fundamental", description: "EBITDA" },
-          { fieldId: "net_margin", dataset: "Fundamental", description: "Net profit margin" },
-          { fieldId: "anl14_eps", dataset: "Analyst", description: "Analyst consensus EPS" },
-          { fieldId: "eps_revision", dataset: "Analyst", description: "EPS revision ratio" },
-          { fieldId: "rating_mean", dataset: "Analyst", description: "Consensus recommendation mean" },
-          { fieldId: "target_price", dataset: "Analyst", description: "Mean target price" },
-          { fieldId: "dispersion_eps", dataset: "Analyst", description: "Standard deviation of EPS estimates" },
-          { fieldId: "close", dataset: "Market", description: "Closing price" },
-          { fieldId: "volume", dataset: "Market", description: "Trading volume" },
-          { fieldId: "returns", dataset: "Market", description: "Daily return" },
-          { fieldId: "adv20", dataset: "Market", description: "Average daily volume 20d" },
-          { fieldId: "vwap", dataset: "Market", description: "Volume weighted average price" },
-          { fieldId: "open_close_ratio", dataset: "Market", description: "Open to close return ratio" },
-        ];
-        await api.datafields.commit(reg, defaultFields).catch(() => {});
-        const refreshed = await api.datafields.list(reg).catch(() => null);
-        if (refreshed && Array.isArray(refreshed) && refreshed.length > 0) {
-          setDatasets(refreshed.map((g: any) => [
-            g.dataset || "Unsorted",
-            String(g.used || 0),
-            String(g.total || (g.fields ? g.fields.length : 0)),
-            g.fields ? g.fields.map((f: any) => (typeof f === "string" ? f : f.fieldId || f.name)) : [],
-          ]));
-        }
       }
-    } catch {}
+      if (regionData?.regions) {
+        const codes = regionData.regions.map((r) => r.code);
+        setRegions(codes);
+        if (!codes.includes(activeRegion) && codes.length) setActiveRegion(codes[0]);
+      }
+      setFreshDatasets(fresh?.untouchedDatasets || []);
+    } catch (error) { setImportError(error instanceof Error ? error.message : "Could not load datafields"); }
   };
 
   useEffect(() => {
     loadDatafieldsFromBackend(activeRegion);
   }, [activeRegion]);
 
+  const reviewExtractedFields = (fields: any[]) => {
+    const normalized = fields.map((field) => ({
+      fieldId: String(field.fieldId || field.id || "").trim(),
+      dataset: String(field.dataset || "Unsorted").trim() || "Unsorted",
+      description: String(field.description || field.desc || ""),
+    })).filter((field) => field.fieldId);
+    setDetectedFieldDetails(normalized);
+    const grouped = new Map<string, string[]>();
+    normalized.forEach((field) => {
+      if (!grouped.has(field.dataset)) grouped.set(field.dataset, []);
+      grouped.get(field.dataset)!.push(field.fieldId);
+    });
+    const groups = Array.from(grouped.entries()).map(([name, fieldIds]) => ({
+      name,
+      countStr: `${fieldIds.length} field${fieldIds.length === 1 ? "" : "s"}`,
+      fieldList: fieldIds.join(", "),
+    }));
+    if (!groups.length) {
+      setImportError("No valid datafield identifiers were found. Check the file or pasted text and try again.");
+      setStage("idle");
+      return;
+    }
+    setDetectedGroups(groups);
+    setSelectedImportGroups(new Set(groups.map((group) => group.name)));
+    setImportError("");
+    setStage("review");
+  };
+
   const start = async () => {
+    if (!rawText.trim()) {
+      setImportError("Paste datafield text or choose an export file first.");
+      return;
+    }
     setStage("processing");
+    setImportError("");
     try {
       // 1. Try AI extraction via OpenRouter first
       const aiRes = await api.datafields.extractAi(rawText, undefined, activeRegion);
       if (aiRes && Array.isArray(aiRes.fields) && aiRes.fields.length > 0) {
-        const groupMap = new Map<string, string[]>();
-        aiRes.fields.forEach((f: any) => {
-          const ds = f.dataset || "Fundamental";
-          if (!groupMap.has(ds)) groupMap.set(ds, []);
-          groupMap.get(ds)!.push(f.fieldId || f.id);
-        });
-        const groups = Array.from(groupMap.entries()).map(([name, fList]) => ({
-          name,
-          countStr: `${fList.length} field${fList.length === 1 ? "" : "s"}`,
-          fieldList: fList.join(", "),
-        }));
-        setDetectedGroups(groups);
-        setSelectedImportGroups(new Set(groups.map((g) => g.name)));
-        setStage("review");
+        reviewExtractedFields(aiRes.fields);
         return;
       }
     } catch {}
@@ -1731,55 +1606,45 @@ function Datafields({
     try {
       const parsedRes = await api.datafields.extract(rawText, undefined, activeRegion);
       if (parsedRes && Array.isArray(parsedRes.fields) && parsedRes.fields.length > 0) {
-        const groupMap = new Map<string, string[]>();
-        parsedRes.fields.forEach((f: any) => {
-          const ds = f.dataset || "Fundamental";
-          if (!groupMap.has(ds)) groupMap.set(ds, []);
-          groupMap.get(ds)!.push(f.fieldId || f.id);
-        });
-        const groups = Array.from(groupMap.entries()).map(([name, fList]) => ({
-          name,
-          countStr: `${fList.length} field${fList.length === 1 ? "" : "s"}`,
-          fieldList: fList.join(", "),
-        }));
-        setDetectedGroups(groups);
-        setSelectedImportGroups(new Set(groups.map((g) => g.name)));
-        setStage("review");
+        reviewExtractedFields(parsedRes.fields);
         return;
       }
     } catch {}
 
-    // 3. Fallback to default preview
-    setTimeout(() => setStage("review"), 600);
+    setImportError("Could not extract fields. Check your API connection and input format, then try again.");
+    setStage("idle");
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        const text = event.target?.result as string;
-        if (text) {
-          setRawText(text);
-          toast(`Loaded ${file.name} (${Math.round(file.size / 1024)} KB)`);
-          start();
-        }
-      };
-      reader.readAsText(file);
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) {
+      setImportError("Choose a file smaller than 5 MB.");
+      e.target.value = "";
+      return;
     }
+    setImportError("");
+    setStage("processing");
+    api.datafields.upload(file, activeRegion).then((result) => {
+      reviewExtractedFields(result.fields || []);
+      toast(`Read ${file.name}`);
+    }).catch((error) => {
+      setStage("idle");
+      setImportError(error instanceof Error ? error.message : "Could not read the selected file");
+    }).finally(() => { e.target.value = ""; });
   };
 
   const addRegion = async () => {
     const name = regionName.trim();
     if (!name) return;
-    if (!regions.some((region) => region.toLowerCase() === name.toLowerCase())) {
-      setRegions((current) => [...current, name]);
+    try {
+      const result = await api.regions.add(name.toUpperCase());
+      setRegions(result.regions.map((r: any) => r.code));
+      setActiveRegion(name.toUpperCase());
+      setRegionName("");
+      setAddingRegion(false);
       toast(`${name} added to your regions`);
-      await api.regions.add(name.toUpperCase()).catch(() => {});
-    }
-    setActiveRegion(name);
-    setRegionName("");
-    setAddingRegion(false);
+    } catch (error) { setImportError(error instanceof Error ? error.message : "Could not add region"); }
   };
 
   const saveImport = async () => {
@@ -1795,49 +1660,19 @@ function Datafields({
           fieldsToCommit.push({
             fieldId: t,
             dataset: g.name,
-            description: `${g.name} metric ${t}`,
+          description: detectedFieldDetails.find((field) => field.dataset === g.name && field.fieldId.toLowerCase() === t)?.description || "",
           });
         });
       }
     });
 
-    if (fieldsToCommit.length > 0) {
-      try {
-        await api.datafields.commit(activeRegion, fieldsToCommit);
-        await loadDatafieldsFromBackend(activeRegion);
-      } catch {}
-    } else {
-      // Local fallback state update
-      setDatasets((current) => {
-        let updated = [...current];
-        if (selectedImportGroups.has("Fundamental")) {
-          updated = updated.map(([n, u, t, f]) =>
-            n === "Fundamental"
-              ? [n, u, String(Number(t) + 5), [...f, "ebit", "operating_income"]]
-              : [n, u, t, f]
-          );
-        }
-        if (selectedImportGroups.has("Analyst")) {
-          updated = updated.map(([n, u, t, f]) =>
-            n === "Analyst"
-              ? [n, u, String(Number(t) + 3), [...f, "target_high", "recommendation_score"]]
-              : [n, u, t, f]
-          );
-        }
-        if (!updated.some(([name]) => name === "News Sentiment")) {
-          updated.push([
-            "News Sentiment",
-            "0",
-            "8",
-            ["news_sentiment", "news_volume", "event_score", "buzz_change"],
-          ]);
-        }
-        return updated;
-      });
-    }
-
-    setStage("done");
-    toast(`Imported fields saved to MongoDB for ${activeRegion}`);
+    if (!fieldsToCommit.length) return setImportError("No fields were selected for import.");
+    try {
+      await api.datafields.commit(activeRegion, fieldsToCommit);
+      await loadDatafieldsFromBackend(activeRegion);
+      setStage("done");
+      toast(`Imported fields saved for ${activeRegion}`);
+    } catch (error) { setImportError(error instanceof Error ? error.message : "Could not save imported fields"); }
   };
 
   const handleExportDatafieldsCSV = () => {
@@ -1917,6 +1752,7 @@ function Datafields({
           <Icon name="plus" size={14} /> Add region
         </button>
       </div>
+      {importError && <p role="alert" className="error-inline">{importError}</p>}
 
       {addingRegion && (
         <form
@@ -1930,14 +1766,14 @@ function Datafields({
             <Icon name="plus" />
           </div>
           <div>
-            <b>Add a research region</b>
+          <b>Add a region code</b>
             <span>Create a custom region workspace for its datasets and fields.</span>
           </div>
           <input
             autoFocus
             value={regionName}
             onChange={(event) => setRegionName(event.target.value)}
-            placeholder="e.g. Latin America"
+            placeholder="e.g. LATAM"
           />
           <Button variant="ghost" onClick={() => setAddingRegion(false)}>
             Cancel
@@ -1956,7 +1792,7 @@ function Datafields({
                 <input
                   type="file"
                   ref={fileInputRef}
-                  accept=".csv,.txt"
+                  accept=".csv,.txt,.tsv"
                   style={{ display: "none" }}
                   onChange={handleFileSelect}
                 />
@@ -1964,7 +1800,7 @@ function Datafields({
                   <Icon name="upload" size={24} />
                 </div>
                 <h3>Drop your datafield export here</h3>
-                <p>CSV or TXT, up to 10 MB</p>
+                <p>CSV, TXT, or TSV, up to 5 MB</p>
                 <Button variant="secondary" onClick={() => fileInputRef.current?.click()}>
                   Choose file
                 </Button>
@@ -1977,7 +1813,7 @@ function Datafields({
                   onChange={(e) => setRawText(e.target.value)}
                 />
                 <Button icon="sparkle" onClick={start}>
-                  Extract with AI
+                  Extract fields
                 </Button>
               </div>
             </>
@@ -1985,8 +1821,8 @@ function Datafields({
           {stage === "processing" && (
             <div className="processing">
               <div className="spinner" />
-              <h3>Quant AI is reading your fields</h3>
-              <p>Detecting datasets, names, and descriptions…</p>
+              <h3>Reading your fields</h3>
+              <p>Extracting identifiers and grouping them by dataset…</p>
               <div className="skeletons">
                 <i />
                 <i />
@@ -2000,7 +1836,7 @@ function Datafields({
                 <div>
                   <Badge tone="green">EXTRACTION COMPLETE</Badge>
                   <h2>Review detected fields</h2>
-                  <p>We grouped fields into 2 datasets. Review before saving.</p>
+                  <p>We grouped the extracted fields into {detectedGroups.length} dataset(s). Review before saving.</p>
                 </div>
                 <Button variant="ghost" onClick={() => setStage("idle")}>
                   Start over
@@ -2061,15 +1897,14 @@ function Datafields({
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <header>
               <div>
-                <h2>Edit {editGroupModal} Field Mapping</h2>
-                <p>Add or customize fields to import into {activeRegion}.</p>
+                <h2>Edit {editGroupModal} field list</h2>
+                <p>Review the extracted identifiers before saving them into {activeRegion}.</p>
               </div>
               <button type="button" className="icon-btn" onClick={() => setEditGroupModal(null)}>
                 <Icon name="x" />
               </button>
             </header>
             <div style={{ display: "flex", flexDirection: "column", gap: "10px", margin: "16px 0" }}>
-              <Badge tone="violet">Prefix: {editGroupModal === "Fundamental" ? "fnd6" : "anl14"}</Badge>
               <label className="field">
                 <span>Field names (comma separated)</span>
                 <input
@@ -2095,7 +1930,7 @@ function Datafields({
                         : g
                     )
                   );
-                  toast(`Saved mapping adjustments for ${editGroupModal}`);
+                  toast(`Updated extracted fields for ${editGroupModal}`);
                   setEditGroupModal(null);
                 }}
               >
@@ -2120,25 +1955,24 @@ function Datafields({
         </Button>
       </div>
 
-      <section className="fresh-card">
+      {freshDatasets.length > 0 && <section className="fresh-card">
         <div className="spark">
           <Icon name="sparkle" />
         </div>
         <div>
           <Badge tone="green">FRESH TERRITORY</Badge>
-          <h3>Explore News Sentiment</h3>
-          <p>You haven’t used any of its 32 fields yet. It pairs well with Fundamental data.</p>
+          <h3>Explore {freshDatasets[0].dataset}</h3>
+          <p>{freshDatasets[0].total} fields in this dataset have not been used in submitted alphas.</p>
         </div>
         <Button
           variant="secondary"
           onClick={() => {
-            saveImport();
-            toast("News Sentiment fields unlocked in your workspace");
+            setFilterQuery(freshDatasets[0].dataset);
           }}
         >
           View recommendation
         </Button>
-      </section>
+      </section>}
 
       <div className="dataset-list">
         {visibleDatasets.map((d, di) => (
@@ -2170,9 +2004,8 @@ function Datafields({
                   key={x}
                   title="Click to copy datafield"
                 >
-                  <span>{i < di + 1 ? <Icon name="check" size={13} /> : <i />}</span>
+                  <span><i /></span>
                   <code>{x}</code>
-                  {i < di + 1 && <small>used in {i + 2}</small>}
                 </button>
               ))}
             </div>
@@ -2194,6 +2027,11 @@ function FixGuide({
 }) {
   const [search, setSearch] = useState("");
   const [topic, setTopic] = useState("All");
+  const [problems, setProblems] = useState<any[]>([]);
+  const [guideError, setGuideError] = useState("");
+  useEffect(() => {
+    api.guide.list().then((rows) => setProblems(rows || [])).catch((error) => setGuideError(error.message || "Could not load guides"));
+  }, []);
 
   // Interactive Diagnostic Lab State
   const [diagExpr, setDiagExpr] = useState("rank(ts_delta(close, 3))");
@@ -2232,47 +2070,10 @@ function FixGuide({
     });
   };
 
-  const problems = [
-    [
-      "High self-correlation",
-      "Your alpha is too similar to signals you have already submitted.",
-      "Use less-explored datafields, change the operator family, or neutralize at a finer group level.",
-      "rank(ts_delta(alt_data_field, 20))",
-      "Correlation",
-    ],
-    [
-      "Low Sharpe",
-      "Returns are not consistent enough relative to volatility.",
-      "Increase the lookback period, winsorize outliers, and combine with a quality filter.",
-      "rank(ts_mean(signal, 20)) * rank(roe)",
-      "Performance",
-    ],
-    [
-      "Turnover too high",
-      "The signal changes positions too frequently.",
-      "Add decay, smooth your input with ts_mean, or increase your lookback window.",
-      "ts_mean(rank(signal), 10)",
-      "Turnover",
-    ],
-    [
-      "Sub-universe failure",
-      "Performance breaks down in smaller stock universes.",
-      "Avoid illiquid fields and normalize by market capitalization.",
-      "group_neutralize(signal, industry)",
-      "Coverage",
-    ],
-    [
-      "Low coverage / NaNs",
-      "Too many instruments have missing input values.",
-      "Backfill sparse fields and combine with a broadly covered field.",
-      "ts_backfill(sparse_field, 120)",
-      "Robustness",
-    ],
-  ];
-
   const filteredProblems = problems.filter((p) => {
-    const matchesSearch = `${p[0]} ${p[1]} ${p[2]}`.toLowerCase().includes(search.toLowerCase());
-    const matchesTopic = topic === "All" || p[4] === topic;
+    const text = `${p.title} ${p.symptoms} ${(p.causes || []).join(" ")} ${(p.fixes || []).join(" ")}`;
+    const matchesSearch = text.toLowerCase().includes(search.toLowerCase());
+    const matchesTopic = topic === "All" || String(p.category || "").toLowerCase() === topic.toLowerCase();
     return matchesSearch && matchesTopic;
   });
 
@@ -2397,36 +2198,33 @@ function FixGuide({
         ))}
       </div>
       <div className="guide-list">
+        {guideError && <p role="alert">{guideError}</p>}
         {filteredProblems.map((p, i) => (
-          <details className="card guide" open={i === 0} key={p[0]}>
+          <details className="card guide" open={i === 0} key={p._id || p.slug}>
             <summary>
               <span className={`problem-icon p${i}`}>
                 <Icon name={i ? "book" : "bell"} />
               </span>
               <div>
-                <h3>{p[0]}</h3>
-                <p>{p[1]}</p>
+                <h3>{p.title}</h3>
+                <p>{p.symptoms}</p>
               </div>
               <Icon name="chevron" />
             </summary>
             <div className="guide-body">
               <h4>What to try</h4>
-              <p>{p[2]}</p>
-              <ol>
-                <li>Inspect fields and compare against your vault history.</li>
-                <li>Apply one structural change at a time and rerun.</li>
-                <li>Validate across regions before submitting.</li>
-              </ol>
-              <div className="expression">
-                <code>{p[3]}</code>
-                <button type="button" onClick={() => onCopy(p[3], p[0])} title="Copy formula">
+              <p>{(p.fixes || []).join("; ")}</p>
+              <ol>{(p.causes || []).map((cause: string) => <li key={cause}>{cause}</li>)}</ol>
+              {(p.examples || []).map((example: string) => <div className="expression" key={example}>
+                <code>{example}</code>
+                <button type="button" onClick={() => onCopy(example, p.title)} title="Copy formula">
                   <Icon name="copy" />
                 </button>
-              </div>
+              </div>)}
               <Button
                 variant="secondary"
                 icon="sparkle"
-                onClick={() => onAskAI(p[0], p[2])}
+                onClick={() => onAskAI(p.title, p.symptoms)}
               >
                 Ask AI about this
               </Button>
@@ -2449,48 +2247,29 @@ function Combinations({
 }) {
   const [personalized, setPersonalized] = useState(false);
   const [riskFilter, setRiskFilter] = useState("All");
-
-  const basePairs = [
-    [
-      "News Sentiment",
-      "Market",
-      "Medium",
-      "Combine fresh narrative signals with price confirmation.",
-      "rank(sentiment) * rank(ts_delta(close, 5))",
-    ],
-    [
-      "Fundamental",
-      "Analyst",
-      "Low",
-      "Quality fundamentals provide a stable base while revisions capture changing expectations.",
-      "rank(roe) * rank(ts_delta(eps_est, 20))",
-    ],
-    [
-      "Options",
-      "Fundamental",
-      "Low",
-      "Use implied expectations to find mispriced balance-sheet quality.",
-      "rank(implied_vol / hist_vol) * rank(bookvalue / cap)",
-    ],
-    [
-      "Analyst",
-      "Short Interest",
-      "High",
-      "Contrast consensus changes with informed bearish positioning.",
-      "-rank(short_interest) * rank(ts_zscore(eps_revision, 30))",
-    ],
-  ];
+  const [basePairs, setBasePairs] = useState<any[]>([]);
+  const [comboError, setComboError] = useState("");
+  useEffect(() => {
+    api.combos.list().then((rows) => setBasePairs((rows || []).map((combo: any) => [
+      combo.datasets?.[0] || "Dataset",
+      combo.datasets?.[1] || "Dataset",
+      String(combo.riskLevel || "medium").replace(/^./, (x: string) => x.toUpperCase()),
+      combo.rationale || "",
+      combo.exampleIdea || "",
+      combo.involvesUnusedDataset,
+    ]))).catch((error) => setComboError(error.message || "Could not load combinations"));
+  }, []);
 
   const pairs = useMemo(() => {
     let list = [...basePairs];
     if (personalized) {
-      list.sort((a, b) => (a[2] === "Low" ? -1 : 1));
+      list.sort((a, b) => Number(Boolean(b[5])) - Number(Boolean(a[5])));
     }
     if (riskFilter !== "All") {
       list = list.filter((p) => p[2] === riskFilter);
     }
     return list;
-  }, [personalized, riskFilter]);
+  }, [basePairs, personalized, riskFilter]);
 
   return (
     <div className="page">
@@ -2522,7 +2301,7 @@ function Combinations({
           <p>
             {personalized
               ? "Re-ordered based on your submitted alphas to minimize self-correlation."
-              : "3 combinations use fields you haven’t explored yet."}
+              : `${basePairs.filter((pair) => pair[5]).length} combinations include untouched datasets.`}
           </p>
         </div>
         <div className="venn">
@@ -2547,6 +2326,7 @@ function Combinations({
       </div>
 
       <div className="combo-grid">
+        {comboError && <p role="alert">{comboError}</p>}
         {pairs.map((p, i) => (
           <article className="card combo" key={p[0] + p[1]}>
             <div className="combo-top">
@@ -2593,16 +2373,11 @@ function Assistant({
   setInitialPrompt?: (s: string) => void;
   onStartInVault?: (expr: string) => void;
 }) {
-  const [messages, setMessages] = useState<Array<{ from: "ai" | "user"; text: string; code?: string }>>([
-    {
-      from: "ai",
-      text: "Good morning, Alex. I can help you diagnose an alpha, find fresh datafields, or explore a new research idea. What are you working on?",
-    },
-  ]);
+  const [messages, setMessages] = useState<Array<{ from: "ai" | "user"; text: string; code?: string }>>([]);
   const [text, setText] = useState(initialPrompt || "");
   const [loading, setLoading] = useState(false);
-  const [contextAlpha, setContextAlpha] = useState<string | null>("Quality momentum");
-  const [activeDatasets, setActiveDatasets] = useState<string[]>(["Fundamental", "Analyst", "Market"]);
+  const [contextAlpha, setContextAlpha] = useState<string | null>(null);
+  const [activeDatasets, setActiveDatasets] = useState<string[]>([]);
 
   const toggleDatasetContext = (d: string) => {
     setActiveDatasets((prev) =>
@@ -2624,7 +2399,7 @@ function Assistant({
     setMessages((m) => [...m, { from: "user", text: userMsg }]);
     setLoading(true);
 
-    let reply = "I analyzed your signal logic. To improve performance while lowering correlation, try combining with orthogonal datasets.";
+    let reply = "";
     let code: string | undefined = undefined;
 
     try {
@@ -2670,7 +2445,7 @@ function Assistant({
               setMessages([
                 {
                   from: "ai",
-                  text: "Chat cleared. What alpha or dataset would you like to explore next?",
+                  text: "What alpha or dataset would you like to explore?",
                 },
               ]);
               toast("Chat history reset");
@@ -2803,7 +2578,7 @@ function Assistant({
         <section>
           <span>DATASETS IN PLAY ({activeDatasets.length})</span>
           <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
-            {["Fundamental", "Analyst", "Market", "News Sentiment"].map((d, i) => (
+            {["Fundamental", "Analyst", "Market", "News Sentiment"].filter((d) => activeDatasets.includes(d)).map((d, i) => (
               <button
                 type="button"
                 key={d}
@@ -2822,117 +2597,16 @@ function Assistant({
   );
 }
 
-const journeyResearch = [
-  {
-    region: "USA",
-    delay: "D1",
-    dataset: "Fundamentals",
-    submitted: true,
-    qualifies: true,
-    fitness: 0.76,
-    sharpe: 2.08,
-    corr: 0.42,
-  },
-  {
-    region: "USA",
-    delay: "D1",
-    dataset: "Analyst",
-    submitted: true,
-    qualifies: true,
-    fitness: 0.68,
-    sharpe: 1.82,
-    corr: 0.51,
-  },
-  {
-    region: "USA",
-    delay: "D1",
-    dataset: "Market",
-    submitted: true,
-    qualifies: false,
-    fitness: 0.39,
-    sharpe: 1.18,
-    corr: 0.73,
-  },
-  {
-    region: "USA",
-    delay: "D0",
-    dataset: "Fundamentals",
-    submitted: true,
-    qualifies: true,
-    fitness: 0.64,
-    sharpe: 1.74,
-    corr: 0.48,
-  },
-  {
-    region: "USA",
-    delay: "D0",
-    dataset: "Market",
-    submitted: true,
-    qualifies: true,
-    fitness: 0.59,
-    sharpe: 1.61,
-    corr: 0.44,
-  },
-  {
-    region: "EUR",
-    delay: "D1",
-    dataset: "Fundamentals",
-    submitted: true,
-    qualifies: true,
-    fitness: 0.66,
-    sharpe: 1.77,
-    corr: 0.38,
-  },
-  {
-    region: "EUR",
-    delay: "D1",
-    dataset: "Analyst",
-    submitted: true,
-    qualifies: false,
-    fitness: 0.41,
-    sharpe: 1.22,
-    corr: 0.67,
-  },
-  {
-    region: "ASI",
-    delay: "D1",
-    dataset: "Market",
-    submitted: true,
-    qualifies: true,
-    fitness: 0.61,
-    sharpe: 1.69,
-    corr: 0.41,
-  },
-  {
-    region: "ASI",
-    delay: "D1",
-    dataset: "Options",
-    submitted: true,
-    qualifies: false,
-    fitness: 0.43,
-    sharpe: 1.27,
-    corr: 0.62,
-  },
-];
-
-const journeyRows = ["USA · D1", "USA · D0", "EUR · D1", "ASI · D1"];
-const journeyCols = ["Fundamentals", "Analyst", "Market", "News", "Options"];
-const coverageStates: CoverageState[][] = [
-  ["covered", "covered", "improve", "progress", "missing"],
-  ["covered", "progress", "covered", "missing", "missing"],
-  ["covered", "improve", "progress", "missing", "missing"],
-  ["progress", "missing", "covered", "missing", "improve"],
-];
-
 function JourneySparkline({ values, green = false }: { values: number[]; green?: boolean }) {
-  const points = values
-    .map((value, index) => `${(index / (values.length - 1)) * 300},${70 - value * 0.58}`)
+  const safeValues = values.filter(Number.isFinite);
+  const points = safeValues
+    .map((value, index) => `${safeValues.length > 1 ? (index / (safeValues.length - 1)) * 300 : 150},${70 - value * 0.58}`)
     .join(" ");
   return (
     <svg className="journey-spark" viewBox="0 0 300 75" preserveAspectRatio="none">
       <path d="M0 18H300M0 40H300M0 62H300" />
       <polyline className={green ? "green" : ""} points={points} />
-      <circle cx="300" cy={70 - values[values.length - 1] * 0.58} r="3" />
+      {safeValues.length > 0 && <circle cx="300" cy={70 - safeValues[safeValues.length - 1] * 0.58} r="3" />}
     </svg>
   );
 }
@@ -2941,10 +2615,12 @@ function Pyramid({
   go,
   toast,
   onStartAlpha,
+  currentUser,
 }: {
   go: (page: Page) => void;
   toast?: (s: string) => void;
   onStartAlpha?: (expr: string) => void;
+  currentUser: any;
 }) {
   const [section, setSection] = useState("Overview");
   const [range, setRange] = useState("30D");
@@ -2957,73 +2633,57 @@ function Pyramid({
   const [whyModal, setWhyModal] = useState(false);
   const [altRecommendation, setAltRecommendation] = useState(false);
   const [allAchievementsModal, setAllAchievementsModal] = useState(false);
-
-  const levelDetails = [
-    {
-      name: "Initiate",
-      xp: "0 XP",
-      status: "Completed",
-      perks: [
-        "Access to single-region research (USA)",
-        "Daily submission quota: 2 alphas",
-        "Fundamental dataset library access",
-        "Basic performance sparklines",
-      ],
-    },
-    {
-      name: "Apprentice",
-      xp: "800 XP",
-      status: "Active (Current Level)",
-      perks: [
-        "Multi-region simulations (USA, Europe, Asia Pacific)",
-        "Daily submission limit: 4 alphas",
-        "Dataset Combinations & Osmosis metrics unlocked",
-        "Analyst revisions and Market datasets unlocked",
-      ],
-    },
-    {
-      name: "Expert",
-      xp: "2,000 XP",
-      status: "In Progress (68% complete)",
-      perks: [
-        "Subindustry and custom group neutralization",
-        "News Sentiment and ESG datafields unlocked",
-        "Daily submission quota: 8 alphas",
-        "Priority simulation queue processing",
-      ],
-    },
-    {
-      name: "Master",
-      xp: "4,500 XP",
-      status: "Locked",
-      perks: [
-        "Custom dataset upload and private signals",
-        "Cross-regional statistical arbitrage framework",
-        "Direct review by WorldQuant Brain portfolio managers",
-      ],
-    },
-    {
-      name: "Grandmaster",
-      xp: "8,000 XP",
-      status: "Locked",
-      perks: [
-        "Institutional capital allocation eligibility",
-        "Global researcher leaderboard feature",
-        "Research fellowship grant and monthly consulting retainer",
-      ],
-    },
-  ];
+  const [journeyData, setJourneyData] = useState<any>(null);
+  const [pyramidData, setPyramidData] = useState<any>(null);
+  const [timelineData, setTimelineData] = useState<any[]>([]);
+  const [achievementData, setAchievementData] = useState<any[]>([]);
+  const [objectiveData, setObjectiveData] = useState<any>(null);
+  const [journeyAnalytics, setJourneyAnalytics] = useState<any>(null);
+  const [scoreMethodology, setScoreMethodology] = useState<any>(null);
+  const [cellData, setCellData] = useState<any>(null);
+  const [journeyError, setJourneyError] = useState("");
+  useEffect(() => {
+    let active = true;
+    Promise.all([
+      api.journey.overview(),
+      api.journey.pyramid(),
+      api.journey.timeline(),
+      api.journey.achievements(),
+      api.journey.objectives(),
+      api.journey.analytics(range.toLowerCase()),
+      api.journey.methodology(),
+    ]).then(([overview, pyramid, timeline, achievements, objectives, analytics, methodology]) => {
+      if (!active) return;
+      setJourneyData(overview);
+      setPyramidData(pyramid);
+      setTimelineData(timeline || []);
+      setAchievementData(achievements || []);
+      setObjectiveData(objectives || []);
+      setJourneyAnalytics(analytics);
+      setScoreMethodology(methodology);
+    }).catch((error) => { if (active) setJourneyError(error.message || "Could not load journey data"); });
+    return () => { active = false; };
+  }, [range]);
+  const matrixRows: any[] = pyramidData?.matrix?.rows || [];
+  const journeyRows = matrixRows.map((row: any) => row.label);
+  const journeyCols: string[] = pyramidData?.matrix?.columns || [];
+  const coverageStates = matrixRows.map((row: any) => row.cells.map((item: any) =>
+    item.status === "needs_improvement" ? "improve" : item.status === "in_progress" ? "progress" : item.status
+  ));
+  useEffect(() => {
+    if (!cell) { setCellData(null); return; }
+    const row = matrixRows[cell.row];
+    const category = row?.cells?.[cell.col]?.category;
+    if (!row || !category) { setCellData(null); return; }
+    api.journey.cell(row.region, row.delay, category).then(setCellData).catch((error) => setJourneyError(error.message || "Could not load pyramid cell"));
+  }, [cell, pyramidData]);
 
   const handleExportTimeline = () => {
-    const timelineEvents = [
-      ["Timestamp", "Event", "Description", "XP Earned"],
-      ["Today · 10:42", "Alpha qualified", "Quality Momentum passed fitness and correlation thresholds", "+35 XP"],
-      ["Yesterday · 16:18", "Dataset discovered", "Started research with News Sentiment in Europe", "+20 XP"],
-      ["20 May · 14:05", "Pyramid milestone", "USA D0 Market became qualified coverage", "+100 XP"],
-      ["18 May · 09:31", "Achievement unlocked", "Regional Pioneer — qualified research in three regions", "+150 XP"],
-      ["17 May · 17:52", "Weekly objective", "Submitted 15th qualifying alpha this week", "+40 XP"],
-      ["12 May · 11:20", "Level upgraded", "Advanced from Initiate to Apprentice", "Level 2"],
-    ];
+    const timelineEvents = [["Timestamp", "Event", "Description"], ...timelineData.map((event: any) => [
+      event.createdAt ? new Date(event.createdAt).toLocaleString() : "",
+      event.title || event.kind || "",
+      event.detail || "",
+    ])];
     const csvContent =
       "data:text/csv;charset=utf-8," +
       timelineEvents.map((r) => r.map((c) => `"${c.replace(/"/g, '""')}"`).join(",")).join("\n");
@@ -3036,26 +2696,25 @@ function Pyramid({
     document.body.removeChild(link);
     if (toast) toast("Downloaded research timeline as CSV");
   };
-  const submitted = journeyResearch.filter((alpha) => alpha.submitted);
-  const qualifying = submitted.filter((alpha) => alpha.qualifies);
-  const uniqueDatasets = new Set(submitted.map((alpha) => alpha.dataset)).size;
-  const uniqueRegions = new Set(submitted.map((alpha) => alpha.region)).size;
-  const uniqueDelays = new Set(submitted.map((alpha) => alpha.delay)).size;
-  const avgFitness = qualifying.reduce((sum, alpha) => sum + alpha.fitness, 0) / qualifying.length;
-  const avgSharpe = qualifying.reduce((sum, alpha) => sum + alpha.sharpe, 0) / qualifying.length;
-  const qualifiedCoverage = coverageStates.flat().filter((state) => state === "covered").length;
-  const osmosis = Math.round(uniqueDatasets * 9 + uniqueRegions * 8 + uniqueDelays * 7);
-  const valueFactor = Math.round(avgFitness * 50 + avgSharpe * 15 + qualifying.length);
-  const xp = 1360;
-  const xpTarget = 2000;
-  const xpPercent = Math.round((xp / xpTarget) * 100);
-  const levels = [
-    ["Initiate", "0 XP"],
-    ["Apprentice", "800 XP"],
-    ["Expert", "2,000 XP"],
-    ["Master", "4,500 XP"],
-    ["Grandmaster", "8,000 XP"],
-  ];
+  const submitted = journeyData?.stats?.submitted || 0;
+  const qualifying = journeyData?.stats?.qualifying || 0;
+  const uniqueDatasets = journeyData?.stats?.datasets?.length || 0;
+  const uniqueRegions = journeyData?.stats?.regions?.length || 0;
+  const uniqueDelays = journeyData?.stats?.delays?.length || 0;
+  const avgFitness = journeyData?.stats?.avgFitness;
+  const avgSharpe = journeyData?.stats?.avgSharpe;
+  const qualifiedCoverage = journeyData?.coverage?.qualified || 0;
+  const activeCoverage = journeyData?.coverage?.cells ? Math.round(((journeyData.coverage.covered || 0) / journeyData.coverage.cells) * 100) : undefined;
+  const totalCells = matrixRows.reduce((sum: number, row: any) => sum + row.cells.length, 0);
+  const osmosis = journeyData?.osmosis?.score || 0;
+  const valueFactor = journeyData?.valueFactor?.score || 0;
+  const xp = journeyData?.xp || 0;
+  const xpTarget = journeyData?.level?.nextLevelXp ?? xp;
+  const levelStartXp = journeyData?.level?.levelStartXp ?? 0;
+  const xpPercent = journeyData?.level?.nextLevelXp > levelStartXp
+    ? Math.max(0, Math.min(100, Math.round(((xp - levelStartXp) / (journeyData.level.nextLevelXp - levelStartXp)) * 100)))
+    : 100;
+  const levels = journeyData?.levels || [];
   const journeyNav = [
     ["Overview", "grid"],
     ["Pyramid Coverage", "pyramid"],
@@ -3066,58 +2725,48 @@ function Pyramid({
     ["Research History", "book"],
     ["Settings", "settings"],
   ];
-  const achievements = [
-    ["First Signal", "Submitted your first alpha", true, "50 XP", 100],
-    ["Explorer", "Used 5 distinct datasets", true, "100 XP", 100],
-    ["Regional Pioneer", "Qualify in 3 regions", true, "150 XP", 100],
-    ["Dataset Specialist", "10 qualifying alphas in one dataset", false, "200 XP", 70],
-    ["Diversification Expert", "Cover 12 pyramid cells", false, "250 XP", 58],
-    ["Consistency Master", "Maintain a 14-day streak", false, "300 XP", 50],
-    ["Pyramid Builder", "Qualify every core category", false, "400 XP", 42],
-    ["Alpha Champion", "Reach Value Factor 80", false, "500 XP", 78],
-  ] as const;
-  const objectives = [
-    ["Submit 20 qualifying alphas", 18, 20, "250 XP", "3 days"],
-    ["Explore two new datasets", 1, 2, "120 XP", "3 days"],
-    ["Improve Value Factor", 62, 65, "180 XP", "5 days"],
-    ["Complete a pyramid milestone", 3, 4, "200 XP", "5 days"],
-  ] as const;
+  const achievements = achievementData.map((item) => [item.title, item.description, item.unlocked, `${item.rewardXp} XP`, item.percent]);
+  const objectives: Array<[string, number, number, string, string]> = (objectiveData?.objectives || []).map((item: any): [string, number, number, string, string] => [item.title, item.current, item.target, `${item.rewardXp} XP`, `${item.daysLeft} days`]);
   const selectedCell = cell
     ? {
         row: journeyRows[cell.row],
+        region: matrixRows[cell.row]?.region,
+        delay: matrixRows[cell.row]?.delay,
         category: journeyCols[cell.col],
         status: coverageStates[cell.row][cell.col],
       }
     : null;
-  const selectedResearch = selectedCell
-    ? journeyResearch.filter((alpha) => {
-        const [region, delay] = selectedCell.row.split(" · ");
-        return (
-          alpha.region === region &&
-          alpha.delay === delay &&
-          alpha.dataset === selectedCell.category
-        );
-      })
-    : [];
-  const recommendation = coverageStates
-    .flatMap((states, row) =>
-      states.map((status, col) => ({
-        row,
-        col,
-        status,
-        score:
-          (journeyRows[row].startsWith("EUR") ? 4 : 0) +
-          (journeyCols[col] === "News" ? 5 : 0) +
-          (status === "missing" ? 3 : status === "improve" ? 2 : 0),
-      })),
-    )
-    .filter((item) => item.status === "missing" || item.status === "improve")
-    .sort((a, b) => b.score - a.score)[0];
-  const recommendedRegion = journeyRows[recommendation.row].split(" · ")[0];
-  const recommendedDelay = journeyRows[recommendation.row].split(" · ")[1];
-  const recommendedCategory = journeyCols[recommendation.col];
-  const recommendedRegionName =
-    recommendedRegion === "EUR" ? "Europe" : recommendedRegion === "ASI" ? "Asia" : "USA";
+  const selectedResearch = (cellData?.alphas || []).map((alpha: any) => ({
+    ...alpha,
+    qualifies: alpha.qualifying,
+    corr: alpha.selfCorrelation,
+    delay: `D${alpha.delay}`,
+    dataset: (alpha.categories || []).join(", "),
+  }));
+  const submittedResearch = selectedResearch.filter((alpha: any) => alpha.status === "submitted");
+  const recommendationOptions = [journeyData?.nextBestAction?.primary, ...(journeyData?.nextBestAction?.alternatives || [])].filter(Boolean);
+  const recommendation = recommendationOptions[altRecommendation ? 1 : 0] || recommendationOptions[0];
+  const recommendedRegion = recommendation?.cell?.region || "—";
+  const recommendedDelay = `D${recommendation?.cell?.delay ?? "—"}`;
+  const recommendedCategory = recommendation?.cell?.category || "—";
+  const recommendedRegionName = recommendedRegion;
+  const osmosisHistory = (journeyAnalytics?.snapshots || []).map((item: any) => item.osmosis).filter(Number.isFinite);
+  const valueHistory = (journeyAnalytics?.snapshots || []).map((item: any) => item.valueFactor).filter(Number.isFinite);
+  const journeyMetrics = [
+    { name: "Osmosis", value: journeyAnalytics?.snapshots?.[journeyAnalytics.snapshots.length - 1]?.osmosis, values: osmosisHistory, green: false },
+    { name: "Value Factor", value: journeyAnalytics?.snapshots?.[journeyAnalytics.snapshots.length - 1]?.valueFactor, values: valueHistory, green: true },
+    { name: "XP earned", value: (journeyAnalytics?.xpByDay || []).reduce((sum: number, item: any) => sum + item.xp, 0), values: (journeyAnalytics?.xpByDay || []).map((item: any) => item.xp), green: false },
+    { name: "Qualified coverage", value: journeyAnalytics?.snapshots?.[journeyAnalytics.snapshots.length - 1]?.qualifiedCells, values: (journeyAnalytics?.snapshots || []).map((item: any) => item.qualifiedCells), green: true },
+    { name: "Average fitness", value: journeyAnalytics?.snapshots?.[journeyAnalytics.snapshots.length - 1]?.avgFitness, values: (journeyAnalytics?.snapshots || []).map((item: any) => item.avgFitness).filter(Number.isFinite), green: true },
+    { name: "Average Sharpe", value: journeyAnalytics?.snapshots?.[journeyAnalytics.snapshots.length - 1]?.avgSharpe, values: (journeyAnalytics?.snapshots || []).map((item: any) => item.avgSharpe).filter(Number.isFinite), green: false },
+    { name: "Average turnover", value: journeyAnalytics?.snapshots?.[journeyAnalytics.snapshots.length - 1]?.avgTurnover, values: (journeyAnalytics?.snapshots || []).map((item: any) => item.avgTurnover).filter(Number.isFinite), green: true },
+    { name: "Self correlation", value: journeyAnalytics?.snapshots?.[journeyAnalytics.snapshots.length - 1]?.avgSelfCorrelation, values: (journeyAnalytics?.snapshots || []).map((item: any) => item.avgSelfCorrelation).filter(Number.isFinite), green: true },
+  ];
+  const osmosisBreadth = journeyData?.osmosis?.components?.find((component: any) => component.key === "datasetDiversity");
+  const osmosisRegions = journeyData?.osmosis?.components?.find((component: any) => component.key === "regionCoverage");
+  const osmosisDelays = journeyData?.osmosis?.components?.find((component: any) => component.key === "delayCoverage");
+  const osmosisDelta = osmosisHistory.length > 1 ? osmosisHistory[osmosisHistory.length - 1] - osmosisHistory[0] : null;
+  const valueDelta = valueHistory.length > 1 ? valueHistory[valueHistory.length - 1] - valueHistory[0] : null;
   const scrollTo = (name: string) => {
     if (name === "Dataset Explorer") {
       go("Datafields");
@@ -3152,10 +2801,10 @@ function Pyramid({
           </button>
         ))}
         <div className="journey-user">
-          <div className="avatar">AM</div>
+          <div className="avatar">{(currentUser?.name || currentUser?.email || "").slice(0, 2).toUpperCase()}</div>
           <span>
-            <b>Alex Morgan</b>
-            <small>Apprentice · Level 2</small>
+            <b>{currentUser?.name || currentUser?.email || "Researcher"}</b>
+            <small>{journeyData?.level?.name || "Level"} · Level {journeyData?.level?.number ?? "—"}</small>
           </span>
         </div>
       </aside>
@@ -3169,21 +2818,20 @@ function Pyramid({
           </div>
           <div className="journey-sync">
             <i />
-            Research data synced
-            <small>2 min ago</small>
+            {journeyError ? "Research data unavailable" : journeyData ? "Research data synced from server" : "Loading research data…"}
           </div>
         </header>
 
         <section className="journey-level">
           <div className="level-summary">
             <div className="level-orbit">
-              <span>02</span>
+              <span>{String(journeyData?.level?.number ?? "—").padStart(2, "0")}</span>
             </div>
             <div>
-              <span className="journey-kicker">CURRENT LEVEL · 2 OF 5</span>
-              <h2>Apprentice</h2>
+              <span className="journey-kicker">CURRENT LEVEL · {journeyData?.level?.number ?? "—"} OF {levels.length || "—"}</span>
+              <h2>{journeyData?.level?.name || "Loading level"}</h2>
               <p>
-                <strong>{xp.toLocaleString()} XP</strong> of {xpTarget.toLocaleString()} to Expert
+                <strong>{xp.toLocaleString()} XP</strong> of {xpTarget.toLocaleString()} to {journeyData?.level?.nextLevelName || "next level"}
               </p>
             </div>
           </div>
@@ -3197,21 +2845,21 @@ function Pyramid({
               <i style={{ left: `${xpPercent}%` }} />
             </div>
             <p>
-              <Icon name="sparkle" size={14} /> {xpTarget - xp} XP to unlock <b>Expert</b>
+              <Icon name="sparkle" size={14} /> {Math.max(0, xpTarget - xp)} XP to unlock <b>{journeyData?.level?.nextLevelName || "next level"}</b>
             </p>
           </div>
           <div className="level-map">
-            {levels.map(([name, requirement], index) => (
+            {levels.map((level: any, index: number) => (
               <button
                 type="button"
-                className={index < 2 ? "complete" : index === 2 ? "next-level" : ""}
-                title={`Click to view ${name} requirements and perks (${requirement})`}
+                className={level.reached ? "complete" : level.current ? "next-level" : ""}
+                title={`${level.name}: ${level.xpRequired.toLocaleString()} XP required`}
                 onClick={() => setSelectedLevelModal(index)}
-                key={name}
+                key={level.number}
               >
-                <i>{index < 2 ? <Icon name="check" size={13} /> : index + 1}</i>
-                <span>{name}</span>
-                <small>{requirement}</small>
+                <i>{level.reached ? <Icon name="check" size={13} /> : level.number}</i>
+                <span>{level.name}</span>
+                <small>{level.xpRequired.toLocaleString()} XP</small>
               </button>
             ))}
           </div>
@@ -3230,26 +2878,26 @@ function Pyramid({
             <div className="score-main">
               <strong>{osmosis}</strong>
               <span>
-                / 100<b>+6.4 this month</b>
+                / 100<b>{osmosisDelta === null ? "No historical snapshot" : `${osmosisDelta >= 0 ? "+" : ""}${osmosisDelta} in range`}</b>
               </span>
-              <JourneySparkline values={[28, 34, 39, 48, 46, 57, 61, 68, osmosis]} />
+              <JourneySparkline values={osmosisHistory} />
             </div>
             <div className="score-metrics">
               <span>
-                <b>{uniqueDatasets}</b>Dataset diversity<small>of 8 tracked</small>
+                <b>{uniqueDatasets}</b>Dataset diversity<small>target {osmosisBreadth?.target ?? "—"}</small>
               </span>
               <span>
-                <b>{uniqueRegions}</b>Region coverage<small>of 5 available</small>
+                <b>{uniqueRegions}</b>Region coverage<small>target {osmosisRegions?.target ?? "—"}</small>
               </span>
               <span>
-                <b>{uniqueDelays}</b>Delay coverage<small>D0 and D1</small>
+                <b>{uniqueDelays}</b>Delay coverage<small>target {osmosisDelays?.target ?? "—"}</small>
               </span>
             </div>
             <div className="score-progress">
               <i style={{ width: `${osmosis}%` }} />
             </div>
             <p>
-              <b>{80 - osmosis} points</b> to the next breadth milestone
+              {journeyData?.osmosis?.components?.[0]?.explain || journeyData?.disclaimer}
             </p>
           </button>
           <button className="journey-score-card value" onClick={() => setScoreInfo("value")}>
@@ -3264,27 +2912,27 @@ function Pyramid({
             <div className="score-main">
               <strong>{valueFactor}</strong>
               <span>
-                / 100<b>+3.1 this month</b>
+                / 100<b>{valueDelta === null ? "No historical snapshot" : `${valueDelta >= 0 ? "+" : ""}${valueDelta} in range`}</b>
               </span>
-              <JourneySparkline green values={[37, 35, 41, 45, 48, 46, 53, 57, valueFactor]} />
+              <JourneySparkline green values={valueHistory} />
             </div>
             <div className="score-metrics">
               <span>
-                <b>{avgFitness.toFixed(2)}</b>Avg. fitness<small>qualifying only</small>
+                <b>{Number.isFinite(avgFitness) ? avgFitness.toFixed(2) : "—"}</b>Avg. fitness<small>qualifying only</small>
               </span>
               <span>
-                <b>{avgSharpe.toFixed(2)}</b>Avg. Sharpe<small>+0.12 vs last month</small>
+                <b>{Number.isFinite(avgSharpe) ? avgSharpe.toFixed(2) : "—"}</b>Avg. Sharpe<small>submitted alphas</small>
               </span>
               <span>
-                <b>{qualifying.length}</b>Qualifying alphas
-                <small>of {submitted.length} submitted</small>
+                <b>{qualifying}</b>Qualifying alphas
+                <small>of {submitted} submitted</small>
               </span>
             </div>
             <div className="score-progress">
               <i style={{ width: `${valueFactor}%` }} />
             </div>
             <p>
-              Best opportunity: <b>raise fitness above 0.70</b>
+              {journeyData?.valueFactor?.opportunities?.[0] || "Submit alpha results to build this estimate."}
             </p>
           </button>
         </section>
@@ -3301,10 +2949,10 @@ function Pyramid({
             </div>
             <div className="coverage-stats">
               <span>
-                <b>{qualifiedCoverage}/20</b>Qualified
+                <b>{qualifiedCoverage}/{totalCells}</b>Qualified
               </span>
               <span>
-                <b>65%</b>Active coverage
+                <b>{activeCoverage ?? "—"}{activeCoverage === undefined ? "" : "%"}</b>Active coverage
               </span>
             </div>
           </div>
@@ -3347,18 +2995,18 @@ function Pyramid({
             <div className="matrix-wrap">
               <div className="pyramid-matrix">
                 <div />
-                {journeyCols.map((column) => (
+                {journeyCols.map((column: string) => (
                   <b key={column}>{column}</b>
                 ))}
-                {journeyRows.map((row, rowIndex) => (
+                {journeyRows.map((row: string, rowIndex: number) => (
                   <div className="matrix-row" key={row}>
                     <strong>
                       {row}
                       <small>
-                        {rowIndex < 2 ? "United States" : rowIndex === 2 ? "Europe" : "Asia"}
+                        {matrixRows[rowIndex].region}
                       </small>
                     </strong>
-                    {journeyCols.map((column, colIndex) => {
+                    {journeyCols.map((column: string, colIndex: number) => {
                       const state = coverageStates[rowIndex][colIndex];
                       const visible =
                         (coverageFilter === "All states" ||
@@ -3403,13 +3051,13 @@ function Pyramid({
               </div>
               <aside className="matrix-summary">
                 <span>QUALIFICATION RATE</span>
-                <strong>{Math.round((qualifying.length / submitted.length) * 100)}%</strong>
+                <strong>{submitted ? Math.round((qualifying / submitted) * 100) : 0}%</strong>
                 <p>
-                  {qualifying.length} of {submitted.length} submitted alphas currently meet fitness,
+                  {qualifying} of {submitted} submitted alphas currently meet fitness,
                   Sharpe, and correlation thresholds.
                 </p>
                 <div>
-                  <i style={{ width: `${(qualifying.length / submitted.length) * 100}%` }} />
+                  <i style={{ width: `${submitted ? (qualifying / submitted) * 100 : 0}%` }} />
                 </div>
                 <button onClick={() => setScoreInfo("value")}>
                   View qualification rules <Icon name="arrow" size={13} />
@@ -3430,12 +3078,8 @@ function Pyramid({
           <div className="action-content">
             <div>
               <Badge tone="blue">HIGHEST EXPECTED IMPACT</Badge>
-              <h2>{altRecommendation ? "Refine USA D1 Market quality" : `Fill your ${recommendedRegionName} gap.`}</h2>
-              <p>
-                {altRecommendation
-                  ? "Your USA D1 Market cell has 2 submitted alphas that failed fitness threshold. Refining lookback to 20 days with cap-weighting will unlock qualified status."
-                  : `Create one ${recommendedRegion} ${recommendedDelay.replace("D", "Delay-")} alpha using ${recommendedCategory} Sentiment. This is your highest-scoring unfilled cell and introduces a category underrepresented in your qualified research.`}
-              </p>
+              <h2>{recommendation?.title || "No research recommendation yet"}</h2>
+              <p>{recommendation?.recommendation || "Submit alpha research to receive a personalized next action."}</p>
               <button
                 type="button"
                 className="why-link"
@@ -3443,33 +3087,29 @@ function Pyramid({
                 title="Click to view detailed scoring breakdown"
               >
                 Why this recommendation?{" "}
-                <span>Coverage gap + dataset diversity + low expected correlation</span>
+                <span>{recommendation?.reason || journeyData?.nextBestAction?.reason || "Based on current research coverage."}</span>
               </button>
             </div>
             <div className="impact-grid">
               <span>
                 <small>EXPECTED XP</small>
-                <b>{altRecommendation ? "+140" : "+180"}</b>
+                <b>{recommendation?.expectedXp ?? "—"}</b>
               </span>
               <span>
                 <small>OSMOSIS IMPACT</small>
-                <b className="blue">{altRecommendation ? "+2–3" : "+4–6"}</b>
+                <b className="blue">{recommendation?.osmosisImpact ?? "—"}</b>
               </span>
               <span>
                 <small>VALUE IMPACT</small>
-                <b className="green">{altRecommendation ? "+4–5" : "+1–3"}</b>
+                <b className="green">{recommendation?.valueFactorImpact ?? "—"}</b>
               </span>
               <span>
                 <small>DIFFICULTY</small>
-                <b>{altRecommendation ? "Low" : "Moderate"}</b>
+                <b>{recommendation?.difficulty || "—"}</b>
               </span>
               <span>
                 <small>EST. TIME</small>
-                <b>{altRecommendation ? "25–35 min" : "45–60 min"}</b>
-              </span>
-              <span>
-                <small>CONFIDENCE</small>
-                <b>{altRecommendation ? "92%" : "84%"}</b>
+                <b>{recommendation?.estimatedMinutes ? `${recommendation.estimatedMinutes} min` : "—"}</b>
               </span>
             </div>
           </div>
@@ -3482,14 +3122,14 @@ function Pyramid({
                 setAltRecommendation(next);
                 if (toast) {
                   toast(
-                    next
-                      ? "Switched recommendation to: USA D1 Market"
-                      : "Switched recommendation to: Europe D0 News Sentiment"
+                      next
+                      ? "Showing another available recommendation"
+                      : "Showing the primary recommendation"
                   );
                 }
               }}
             >
-              {altRecommendation ? "Switch back: Europe D0 News Sentiment" : "Alternative: Improve USA D1 Market quality"}{" "}
+              {altRecommendation ? "Show primary recommendation" : "Show an alternative recommendation"}{" "}
               <Icon name="chevron" size={14} />
             </button>
             <div>
@@ -3499,9 +3139,7 @@ function Pyramid({
               <Button
                 icon="arrow"
                 onClick={() => {
-                  const expr = altRecommendation
-                    ? "rank(ts_delta(close, 20)) * rank(volume / adv20)"
-                    : "rank(news_sentiment) * rank(ts_delta(target_price, 10))";
+                  const expr = recommendation?.expression || "";
                   if (onStartAlpha) onStartAlpha(expr);
                   go("Alpha Vault");
                 }}
@@ -3515,11 +3153,11 @@ function Pyramid({
         <section className="journey-section" id="journey-weekly-objectives">
           <div className="journey-section-title">
             <div>
-              <span>WEEK 21 · 3 DAYS LEFT</span>
+              <span>PERSONALIZED RESEARCH TARGETS</span>
               <h2>Weekly Objectives</h2>
               <p>Focused goals that translate research activity into measurable progression.</p>
             </div>
-            <b className="week-xp">750 XP available</b>
+            <b className="week-xp">{objectiveData?.objectives?.reduce((sum: number, item: any) => sum + (item.rewardXp || 0), 0) ?? 0} XP available</b>
           </div>
           <div className="objective-grid">
             {objectives.map(([name, current, target, reward, deadline], index) => {
@@ -3613,64 +3251,15 @@ function Pyramid({
             </div>
           </div>
           <div className="analytics-grid">
-            {[
-              [
-                "Osmosis history",
-                osmosis,
-                "+6.4",
-                false,
-                [38, 42, 45, 51, 55, 60, 64, 69, osmosis],
-              ],
-              [
-                "Value Factor",
-                valueFactor,
-                "+3.1",
-                true,
-                [35, 39, 38, 44, 48, 51, 55, 59, valueFactor],
-              ],
-              ["XP earned", xp, "+280", false, [18, 28, 24, 45, 39, 61, 52, 74, 88]],
-              [
-                "Coverage growth",
-                `${qualifiedCoverage}/20`,
-                "+2 cells",
-                true,
-                [20, 24, 31, 33, 42, 48, 53, 58, 65],
-              ],
-              [
-                "Alpha fitness",
-                avgFitness.toFixed(2),
-                "+0.04",
-                true,
-                [45, 42, 48, 51, 49, 56, 58, 61, avgFitness * 100],
-              ],
-              [
-                "Sharpe ratio",
-                avgSharpe.toFixed(2),
-                "+0.12",
-                false,
-                [42, 48, 45, 52, 54, 59, 62, 66, avgSharpe * 38],
-              ],
-              ["Turnover", "18.4%", "−2.1%", true, [72, 68, 70, 59, 62, 55, 49, 45, 42]],
-              ["Correlation", "0.47", "−0.06", true, [75, 69, 72, 61, 65, 57, 53, 49, 47]],
-            ].map(([name, value, change, green, values]) => (
-              <article className="journey-card analytic" key={name as string}>
+            {journeyMetrics.map(({ name, value, green, values }) => (
+              <article className="journey-card analytic" key={name}>
                 <header>
-                  <span>{name as string}</span>
-                  <Badge tone={String(change).startsWith("−") ? "green" : "blue"}>
-                    {change as string}
-                  </Badge>
+                  <span>{name}</span>
                 </header>
-                <strong>{value as string | number}</strong>
-                <JourneySparkline green={green as boolean} values={values as number[]} />
+                <strong>{Number.isFinite(value) ? value : "—"}</strong>
+                <JourneySparkline green={green} values={values} />
                 <small>
-                  {range === "7D"
-                    ? "Daily"
-                    : range === "30D"
-                      ? "Weekly"
-                      : range === "90D"
-                        ? "Biweekly"
-                        : "Monthly"}{" "}
-                  trend · qualifying data where applicable
+                  {values.length ? `${values.length} recorded data points` : "No recorded data for this range"}
                 </small>
               </article>
             ))}
@@ -3689,64 +3278,22 @@ function Pyramid({
             </Button>
           </div>
           <div className="journey-card timeline">
-            {[
-              [
-                "Today · 10:42",
-                "Alpha qualified",
-                "Quality Momentum passed fitness and correlation thresholds.",
-                "+35 XP",
-                "check",
-              ],
-              [
-                "Yesterday · 16:18",
-                "Dataset discovered",
-                "Started research with News Sentiment in Europe.",
-                "+20 XP",
-                "database",
-              ],
-              [
-                "20 May · 14:05",
-                "Pyramid milestone",
-                "USA D0 Market became qualified coverage.",
-                "+100 XP",
-                "pyramid",
-              ],
-              [
-                "18 May · 09:31",
-                "Achievement unlocked",
-                "Regional Pioneer — qualified research in three regions.",
-                "+150 XP",
-                "sparkle",
-              ],
-              [
-                "17 May · 17:52",
-                "Weekly objective",
-                "Submitted 15th qualifying alpha this week.",
-                "+40 XP",
-                "check",
-              ],
-              [
-                "12 May · 11:20",
-                "Level upgraded",
-                "Advanced from Initiate to Apprentice.",
-                "Level 2",
-                "arrow",
-              ],
-            ].map(([date, title, copy, reward, icon], index) => (
-              <article key={title}>
+            {timelineData.map((event: any, index: number) => (
+              <article key={event._id || `${event.createdAt}-${event.title}`}>
                 <div className="timeline-line">
-                  <i className={index < 2 ? "active" : ""}>
-                    <Icon name={icon} size={15} />
+                  <i className={index === 0 ? "active" : ""}>
+                    <Icon name={event.kind === "alpha_submit" ? "check" : event.kind === "level_up" ? "arrow" : "sparkle"} size={15} />
                   </i>
                 </div>
-                <time>{date}</time>
+                <time>{event.createdAt ? new Date(event.createdAt).toLocaleString() : ""}</time>
                 <div>
-                  <b>{title}</b>
-                  <p>{copy}</p>
+                  <b>{event.title || event.kind}</b>
+                  <p>{event.detail || ""}</p>
                 </div>
-                <Badge tone={index === 3 ? "amber" : "green"}>{reward}</Badge>
+                {event.meta?.xp ? <Badge tone="green">+{event.meta.xp} XP</Badge> : null}
               </article>
             ))}
+            {!timelineData.length && <p>No research history has been recorded yet.</p>}
           </div>
         </section>
       </div>
@@ -3783,35 +3330,31 @@ function Pyramid({
             </div>
             <div className="detail-grid">
               {[
-                ["Region", selectedCell.row.split(" · ")[0]],
-                ["Delay", selectedCell.row.split(" · ")[1]],
+                ["Region", selectedCell.region],
+                ["Delay", `D${selectedCell.delay}`],
                 ["Category", selectedCell.category],
-                ["Available datasets", selectedCell.category === "News" ? "12" : "8"],
-                ["Submitted alphas", String(selectedResearch.length)],
-                ["Qualifying alphas", String(selectedResearch.filter((x) => x.qualifies).length)],
+                ["Available datasets", String(cellData?.cell?.datasets?.length ?? 0)],
+                ["Submitted alphas", String(submittedResearch.length)],
+                ["Qualifying alphas", String(submittedResearch.filter((x: any) => x.qualifies).length)],
                 [
                   "Average fitness",
-                  selectedResearch.length
-                    ? (
-                        selectedResearch.reduce((s, x) => s + x.fitness, 0) /
-                        selectedResearch.length
-                      ).toFixed(2)
+                  submittedResearch.some((x: any) => Number.isFinite(x.fitness))
+                    ? (submittedResearch.filter((x: any) => Number.isFinite(x.fitness)).reduce((s: number, x: any) => s + x.fitness, 0) /
+                        submittedResearch.filter((x: any) => Number.isFinite(x.fitness)).length).toFixed(2)
                     : "—",
                 ],
                 [
                   "Average Sharpe",
-                  selectedResearch.length
-                    ? (
-                        selectedResearch.reduce((s, x) => s + x.sharpe, 0) / selectedResearch.length
-                      ).toFixed(2)
+                  submittedResearch.some((x: any) => Number.isFinite(x.sharpe))
+                    ? (submittedResearch.filter((x: any) => Number.isFinite(x.sharpe)).reduce((s: number, x: any) => s + x.sharpe, 0) /
+                        submittedResearch.filter((x: any) => Number.isFinite(x.sharpe)).length).toFixed(2)
                     : "—",
                 ],
                 [
                   "Avg. correlation",
-                  selectedResearch.length
-                    ? (
-                        selectedResearch.reduce((s, x) => s + x.corr, 0) / selectedResearch.length
-                      ).toFixed(2)
+                  submittedResearch.some((x: any) => Number.isFinite(x.corr))
+                    ? (submittedResearch.filter((x: any) => Number.isFinite(x.corr)).reduce((s: number, x: any) => s + x.corr, 0) /
+                        submittedResearch.filter((x: any) => Number.isFinite(x.corr)).length).toFixed(2)
                     : "—",
                 ],
               ].map(([label, value]) => (
@@ -3827,24 +3370,7 @@ function Pyramid({
                 An alpha must be submitted and pass minimum fitness, Sharpe, turnover, and
                 correlation checks. Simply exploring a dataset creates coverage, not qualification.
               </p>
-              <div className="rule">
-                <span>Fitness ≥ 0.50</span>
-                <Badge tone={selectedResearch.some((x) => x.fitness >= 0.5) ? "green" : "neutral"}>
-                  {selectedResearch.some((x) => x.fitness >= 0.5) ? "Passed" : "Pending"}
-                </Badge>
-              </div>
-              <div className="rule">
-                <span>Sharpe ≥ 1.50</span>
-                <Badge tone={selectedResearch.some((x) => x.sharpe >= 1.5) ? "green" : "neutral"}>
-                  {selectedResearch.some((x) => x.sharpe >= 1.5) ? "Passed" : "Pending"}
-                </Badge>
-              </div>
-              <div className="rule">
-                <span>Correlation &lt; 0.70</span>
-                <Badge tone={selectedResearch.some((x) => x.corr < 0.7) ? "green" : "neutral"}>
-                  {selectedResearch.some((x) => x.corr < 0.7) ? "Passed" : "Pending"}
-                </Badge>
-              </div>
+              {cellData?.thresholds && <div className="rule">Configured qualification thresholds: fitness ≥ {cellData.thresholds.minFitness}, Sharpe ≥ {cellData.thresholds.minSharpe}, self-correlation ≤ {cellData.thresholds.maxSelfCorrelation}</div>}
             </section>
             <footer>
               <Button variant="secondary" onClick={() => go("Datafields")}>
@@ -3872,24 +3398,19 @@ function Pyramid({
             <header>
               <div>
                 <span>GENIUS ROADMAP · LEVEL {selectedLevelModal + 1}</span>
-                <h2>{levelDetails[selectedLevelModal].name}</h2>
+              <h2>{levels[selectedLevelModal]?.name || "Level"}</h2>
               </div>
               <button className="icon-btn" onClick={() => setSelectedLevelModal(null)}>
                 <Icon name="x" />
               </button>
             </header>
             <div style={{ margin: "16px 0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <Badge tone={selectedLevelModal < 2 ? "green" : selectedLevelModal === 2 ? "blue" : "neutral"}>
-                {levelDetails[selectedLevelModal].status}
+              <Badge tone={levels[selectedLevelModal]?.reached ? "green" : levels[selectedLevelModal]?.current ? "blue" : "neutral"}>
+                {levels[selectedLevelModal]?.reached ? "Reached" : levels[selectedLevelModal]?.current ? "Current level" : "Not reached"}
               </Badge>
-              <b>Required: {levelDetails[selectedLevelModal].xp}</b>
+              <b>Required: {levels[selectedLevelModal]?.xpRequired?.toLocaleString()} XP</b>
             </div>
-            <h4 style={{ margin: "12px 0 8px", fontSize: "13px" }}>Unlocked Capabilities &amp; Perks:</h4>
-            <ul style={{ margin: "0 0 18px 18px", fontSize: "13px", lineHeight: "1.6", color: "var(--muted)" }}>
-              {levelDetails[selectedLevelModal].perks.map((p, idx) => (
-                <li key={idx} style={{ color: "inherit" }}>{p}</li>
-              ))}
-            </ul>
+            <p>Level requirements are loaded from your account progression settings.</p>
             <footer>
               <Button onClick={() => setSelectedLevelModal(null)}>Close details</Button>
             </footer>
@@ -3909,28 +3430,10 @@ function Pyramid({
                 <Icon name="x" />
               </button>
             </header>
-            <p style={{ fontSize: "13px", color: "var(--muted)", margin: "14px 0" }}>
-              The QuantStorm journey optimizer recommends the research path that generates the maximum marginal progress towards your next Genius level:
-            </p>
+            <p style={{ fontSize: "13px", color: "var(--muted)", margin: "14px 0" }}>{journeyData?.nextBestAction?.method || "Recommendations are based on your recorded alpha coverage and scores."}</p>
             <div style={{ display: "flex", flexDirection: "column", gap: "10px", margin: "14px 0" }}>
-              <div style={{ padding: "12px", background: "rgba(255,255,255,0.04)", borderRadius: "8px", border: "1px solid var(--border)" }}>
-                <b style={{ display: "block", color: "var(--accent)" }}>1. Uncovered Pyramid Cell (+5 pts)</b>
-                <span style={{ fontSize: "12px", color: "var(--muted)" }}>
-                  Europe D0 News Sentiment currently has 0 qualifying alphas. Fulfilling it turns the cell qualified on your research matrix.
-                </span>
-              </div>
-              <div style={{ padding: "12px", background: "rgba(255,255,255,0.04)", borderRadius: "8px", border: "1px solid var(--border)" }}>
-                <b style={{ display: "block", color: "#18a66a" }}>2. Zero Dataset Overlap (+4 pts)</b>
-                <span style={{ fontSize: "12px", color: "var(--muted)" }}>
-                  You haven't used any News Sentiment fields yet. New dataset families guarantee minimal self-correlation against your vault.
-                </span>
-              </div>
-              <div style={{ padding: "12px", background: "rgba(255,255,255,0.04)", borderRadius: "8px", border: "1px solid var(--border)" }}>
-                <b style={{ display: "block", color: "#4e8cf7" }}>3. High Osmosis Yield (+3 pts)</b>
-                <span style={{ fontSize: "12px", color: "var(--muted)" }}>
-                  Expected XP: +180 XP, Osmosis increase: +4 to +6 points towards your Apprentice milestone.
-                </span>
-              </div>
+              {(recommendation?.why || []).map((reason: string, index: number) => <div key={reason} style={{ padding: "12px", background: "rgba(255,255,255,0.04)", borderRadius: "8px", border: "1px solid var(--border)" }}><b style={{ display: "block", color: "var(--accent)" }}>{index + 1}. {reason}</b></div>)}
+              {!recommendation && <p>No next action is available yet.</p>}
             </div>
             <footer>
               <Button onClick={() => setWhyModal(false)}>Got it</Button>
@@ -4009,43 +3512,22 @@ function Pyramid({
                 <small>Recalculated from synced research</small>
               </span>
             </div>
-            {scoreInfo === "osmosis" ? (
-              <div className="formula">
-                <p>
-                  <b>Dataset diversity</b>
-                  <span>{uniqueDatasets} × 9</span>
-                  <strong>{uniqueDatasets * 9}</strong>
+            <div className="formula">
+              {(scoreInfo === "osmosis"
+                ? journeyData?.osmosis?.components
+                : journeyData?.valueFactor?.components
+              )?.map((component: any) => (
+                <p key={component.key}>
+                  <b>{component.label}</b>
+                  <span>{component.explain}</span>
+                  <strong>{component.ratio == null ? "—" : `${Math.round(component.ratio * 100)}% × ${component.weight}%`}</strong>
                 </p>
-                <p>
-                  <b>Region coverage</b>
-                  <span>{uniqueRegions} × 8</span>
-                  <strong>{uniqueRegions * 8}</strong>
-                </p>
-                <p>
-                  <b>Delay coverage</b>
-                  <span>{uniqueDelays} × 7</span>
-                  <strong>{uniqueDelays * 7}</strong>
-                </p>
-              </div>
-            ) : (
-              <div className="formula">
-                <p>
-                  <b>Qualifying fitness</b>
-                  <span>{avgFitness.toFixed(2)} × 50</span>
-                  <strong>{Math.round(avgFitness * 50)}</strong>
-                </p>
-                <p>
-                  <b>Qualifying Sharpe</b>
-                  <span>{avgSharpe.toFixed(2)} × 15</span>
-                  <strong>{Math.round(avgSharpe * 15)}</strong>
-                </p>
-                <p>
-                  <b>Qualifying alpha count</b>
-                  <span>{qualifying.length} × 1</span>
-                  <strong>{qualifying.length}</strong>
-                </p>
-              </div>
-            )}
+              ))}
+              <small>{scoreInfo === "osmosis"
+                ? scoreMethodology?.osmosis?.formula
+                : scoreMethodology?.valueFactor?.formula}</small>
+              {scoreInfo === "osmosis" && <small>{scoreMethodology?.qualification?.note}</small>}
+            </div>
             <div className="method-note">
               <Icon name="book" />
               <p>
@@ -4096,113 +3578,71 @@ function Finance({
   onCopy: (text: string, label: string) => void;
 }) {
   const [modal, setModal] = useState(false);
-  const [activeTab, setActiveTab] = useState<"Overview" | "Salary" | "Referrals">("Overview");
-  const [financeRange, setFinanceRange] = useState<"3m" | "6m" | "12m" | "all">("6m");
+  const [activeTab, setActiveTab] = useState<"Overview" | "Salary" | "Referrals" | "Bonus">("Overview");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
 
-  const [records, setRecords] = useState<Array<[string, string, string, string, string?]>>([
-    ["20 May 2024", "Salary", "May alpha compensation", "$1,560"],
-    ["12 May 2024", "Referral", "5 active researchers", "$280"],
-    ["30 Apr 2024", "Salary", "April alpha compensation", "$1,610"],
-    ["15 Apr 2024", "Referral", "4 active researchers", "$240"],
-    ["31 Mar 2024", "Salary", "March alpha compensation", "$1,230"],
-  ]);
+  const [records, setRecords] = useState<Array<[string, string, string, string, string?]>>([]);
+  const [financeSummary, setFinanceSummary] = useState<any>(null);
 
   // Load finance records from MongoDB on mount
   useEffect(() => {
     let active = true;
-    api.finance.list().then(async (res) => {
+    Promise.all([api.finance.list(), api.finance.summary()]).then(([res, summary]) => {
       if (!active) return;
-      if (res && Array.isArray(res.items) && res.items.length > 0) {
+      setFinanceSummary(summary);
+      if (res && Array.isArray(res.items)) {
         setRecords(
           res.items.map((it: any) => [
             it.date
               ? new Date(it.date).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })
-              : "Today",
+              : "—",
             it.type ? it.type.charAt(0).toUpperCase() + it.type.slice(1) : "Salary",
             it.note || it.description || "Alpha compensation",
             `$${(it.amount || 0).toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`,
             it._id || it.id,
           ])
         );
-      } else {
-        // Seed initial records to MongoDB if empty
-        const initial = [
-          { date: "2024-05-20", type: "salary", amount: 1560, note: "May alpha compensation" },
-          { date: "2024-05-12", type: "referral", amount: 280, note: "5 active researchers" },
-          { date: "2024-04-30", type: "salary", amount: 1610, note: "April alpha compensation" },
-          { date: "2024-04-15", type: "referral", amount: 240, note: "4 active researchers" },
-          { date: "2024-03-31", type: "salary", amount: 1230, note: "March alpha compensation" },
-        ];
-        for (const it of initial) {
-          await api.finance.addEntry(it).catch(() => {});
-        }
-        const refreshed = await api.finance.list().catch(() => null);
-        if (active && refreshed && Array.isArray(refreshed.items) && refreshed.items.length > 0) {
-          setRecords(
-            refreshed.items.map((it: any) => [
-              it.date
-                ? new Date(it.date).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })
-                : "Today",
-              it.type ? it.type.charAt(0).toUpperCase() + it.type.slice(1) : "Salary",
-              it.note || it.description || "Alpha compensation",
-              `$${(it.amount || 0).toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`,
-              it._id || it.id,
-            ])
-          );
-        }
       }
-    }).catch(() => {});
+    }).catch((error) => toast(error instanceof Error ? error.message : "Could not load earnings data")).finally(() => setLoading(false));
     return () => {
       active = false;
     };
   }, []);
 
   // Modal form states
-  const [newDate, setNewDate] = useState("2024-05-20");
+  const [newDate, setNewDate] = useState(new Date().toISOString().slice(0, 10));
   const [newType, setNewType] = useState("Salary");
   const [newAmount, setNewAmount] = useState("");
   const [newDesc, setNewDesc] = useState("");
 
   const filteredRecords = useMemo(() => {
     if (activeTab === "Overview") return records;
-    return records.filter((r) => r[1] === activeTab);
+    const type = activeTab === "Referrals" ? "Referral" : activeTab;
+    return records.filter((r) => r[1] === type);
   }, [records, activeTab]);
+  const now = new Date();
+  const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  const quarterKey = `${now.getFullYear()}-Q${Math.ceil((now.getMonth() + 1) / 3)}`;
+  const currency = (amount: number) => `$${Number(amount || 0).toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
 
-  const financeChartData = {
-    "3m": {
-      bars: [53, 69, 91],
-      labels: ["Mar", "Apr", "May"],
-    },
-    "6m": {
-      bars: [45, 62, 53, 78, 69, 91],
-      labels: ["Dec", "Jan", "Feb", "Mar", "Apr", "May"],
-    },
-    "12m": {
-      bars: [30, 42, 38, 45, 50, 48, 55, 62, 53, 78, 69, 91],
-      labels: ["Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May"],
-    },
-    "all": {
-      bars: [35, 48, 65, 82, 95],
-      labels: ["2022", "2023 Q1", "2023 Q3", "2023 Q4", "2024 YTD"],
-    },
-  }[financeRange];
-
-  const handleDeleteRecord = (idx: number) => {
+  const handleDeleteRecord = async (idx: number) => {
     const item = filteredRecords[idx];
-    setRecords((prev) => prev.filter((r) => r !== item));
-    toast("Earnings entry removed");
-    if (item && item[4]) {
-      api.finance.deleteEntry(item[4]).catch(() => {});
+    if (!item?.[4]) return;
+    try {
+      await api.finance.deleteEntry(item[4]);
+      setRecords((prev) => prev.filter((r) => r !== item));
+      setFinanceSummary(await api.finance.summary());
+      toast("Earnings entry removed");
     }
+    catch (error) { toast(error instanceof Error ? error.message : "Could not remove earnings entry"); }
   };
 
   const handleExportCSV = () => {
-    const csv =
-      "data:text/csv;charset=utf-8," +
-      ["Date,Type,Description,Amount"]
-        .concat(records.map((r) => `"${r[0]}","${r[1]}","${r[2]}","${r[3]}"`))
-        .join("\n");
-    const encoded = encodeURI(csv);
+    const csv = ["Date,Type,Description,Amount"]
+      .concat(records.map((r) => [r[0], r[1], r[2], r[3]].map(csvCell).join(",")))
+      .join("\n");
+    const encoded = `data:text/csv;charset=utf-8,${encodeURIComponent(csv)}`;
     const link = document.createElement("a");
     link.setAttribute("href", encoded);
     link.setAttribute("download", `quantstorm-earnings-${new Date().toISOString().slice(0, 10)}.csv`);
@@ -4214,34 +3654,28 @@ function Finance({
 
   const handleAddEntry = async (e: FormEvent) => {
     e.preventDefault();
-    if (!newAmount) return;
-    const num = parseFloat(newAmount) || 0;
+    if (!newAmount || !newDate) return;
+    const num = Number(newAmount);
+    if (!Number.isFinite(num) || num < 0) return toast("Enter a valid non-negative amount");
     const formattedAmount = `$${num.toLocaleString("en-US", {
       minimumFractionDigits: 0,
       maximumFractionDigits: 2,
     })}`;
     const desc = newDesc.trim() || `${newType} payout payment`;
-    const tempEntry: [string, string, string, string, string?] = [newDate, newType, desc, formattedAmount];
-    setRecords([tempEntry, ...records]);
-    setModal(false);
-    setNewAmount("");
-    setNewDesc("");
-    toast("Earning entry saved to MongoDB ledger");
-
+    setSaving(true);
     try {
       const res = await api.finance.addEntry({
         date: newDate,
-        type: newType.toLowerCase() === "referral" ? "referral" : "salary",
+        type: newType.toLowerCase(),
         amount: num,
         description: desc,
       });
-      if (res && (res._id || res.id)) {
-        const id = res._id || res.id;
-        setRecords((prev) =>
-          prev.map((r) => (r === tempEntry ? [r[0], r[1], r[2], r[3], id] : r))
-        );
-      }
-    } catch {}
+      const entry = res?.item || res;
+      setRecords((prev) => [[new Date(entry.date).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }), newType, entry.note || desc, formattedAmount, entry._id || entry.id], ...prev]);
+      setFinanceSummary(await api.finance.summary());
+      setModal(false); setNewAmount(""); setNewDesc(""); toast("Earnings entry saved");
+    } catch (error) { toast(error instanceof Error ? error.message : "Could not save earnings entry"); }
+    finally { setSaving(false); }
   };
 
   return (
@@ -4252,12 +3686,13 @@ function Finance({
           <h1>Finance</h1>
           <p>Track your research rewards and referral income.</p>
         </div>
-        <Button icon="plus" onClick={() => setModal(true)}>
-          Add entry
-        </Button>
+        <div className="page-actions">
+          <Button variant="secondary" icon="download" onClick={handleExportCSV}>Export earnings</Button>
+          <Button icon="plus" onClick={() => setModal(true)}>Add earning</Button>
+        </div>
       </header>
       <div className="tab-line">
-        {(["Overview", "Salary", "Referrals"] as const).map((t) => (
+        {(["Overview", "Salary", "Referrals", "Bonus"] as const).map((t) => (
           <button
             type="button"
             className={activeTab === t ? "active" : ""}
@@ -4269,39 +3704,27 @@ function Finance({
         ))}
       </div>
       <div className="stats-grid">
-        <Stat label="This month" value="$1,840" delta="+14.2% vs last month" icon="wallet" />
-        <Stat label="This quarter" value="$4,920" delta="82% of forecast" icon="grid" />
-        <Stat label="All time" value="$18,460" delta="Since March 2023" icon="pyramid" />
-        <Stat label="Referral earnings" value="$2,180" delta="11 active referrals" icon="layers" />
+        <Stat label="This month" value={currency(financeSummary?.monthly?.[currentMonth] || 0)} delta="Recorded earnings" icon="wallet" />
+        <Stat label="This quarter" value={currency(financeSummary?.quarterly?.[quarterKey] || 0)} delta="Recorded earnings" icon="grid" />
+        <Stat label="All time" value={currency(financeSummary?.all || 0)} delta={`${records.length} payment records`} icon="pyramid" />
+        <Stat label="Referral earnings" value={currency(financeSummary?.byType?.referral || 0)} delta={`${financeSummary?.referral?.count ?? 0} referrals`} icon="layers" />
       </div>
       <div className="two-col wide-left">
         <section className="card finance-chart">
           <div className="card-head">
             <div>
-              <h3>Earnings over time</h3>
-              <p>Salary and referral income</p>
+              <h3>Earnings by month</h3>
+              <p>Totals from recorded payment entries</p>
             </div>
-            <select
-              value={financeRange}
-              onChange={(e) => {
-                setFinanceRange(e.target.value as any);
-                toast(`Earnings chart updated for ${e.target.value}`);
-              }}
-            >
-              <option value="3m">Last 3 months</option>
-              <option value="6m">Last 6 months</option>
-              <option value="12m">Last 12 months</option>
-              <option value="all">All time</option>
-            </select>
           </div>
           <div className="money-bars">
-            {financeChartData.bars.map((x, i) => (
-              <div key={i}>
-                <span style={{ height: `${x}%` }} />
-                <i style={{ height: `${x / 4}%` }} />
-                <small>{financeChartData.labels[i]}</small>
-              </div>
-            ))}
+            {Object.entries(financeSummary?.monthly || {}).slice(-12).map(([month, amount]) => {
+              const values = Object.values(financeSummary?.monthly || {}) as number[];
+              const max = Math.max(...values, 1);
+              const height = Math.max(2, (Number(amount) / max) * 100);
+              return <div key={month}><span style={{ height: `${height}%` }} /><small>{month}</small></div>;
+            })}
+            {!Object.keys(financeSummary?.monthly || {}).length && <p>No payment data is recorded yet.</p>}
           </div>
         </section>
         <section className="card referral">
@@ -4309,10 +3732,10 @@ function Finance({
           <h3>Earn together</h3>
           <p>Share QuantStorm and track your network earnings.</p>
           <div className="copy-link">
-            <code>quantstorm.io/r/alex7</code>
+            <code>{financeSummary?.referral?.code || "Referral code unavailable"}</code>
             <button
               type="button"
-              onClick={() => onCopy("https://quantstorm.io/r/alex7", "Referral link")}
+              onClick={() => financeSummary?.referral?.code && onCopy(`${window.location.origin}/?ref=${financeSummary.referral.code}`, "Referral link")}
               title="Copy referral link"
             >
               <Icon name="copy" />
@@ -4320,11 +3743,11 @@ function Finance({
           </div>
           <div>
             <span>Active referrals</span>
-            <b>11</b>
+            <b>{financeSummary?.referral?.count ?? 0}</b>
           </div>
           <div>
             <span>This month</span>
-            <b>$280</b>
+            <b>{currency(financeSummary?.monthlyByType?.[currentMonth]?.referral || 0)}</b>
           </div>
         </section>
       </div>
@@ -4350,10 +3773,10 @@ function Finance({
             </tr>
           </thead>
           <tbody>
-            {filteredRecords.map((r, i) => (
+            {loading ? <tr><td colSpan={6} style={{ textAlign: "center", padding: "28px", color: "var(--muted)" }}>Loading earnings…</td></tr> : filteredRecords.length === 0 ? <tr><td colSpan={6} style={{ textAlign: "center", padding: "28px", color: "var(--muted)" }}>No earnings have been recorded for this view.</td></tr> : filteredRecords.map((r, i) => (
               <tr key={r[0] + i}>
                 {r.slice(0, 4).map((x, j) => (
-                  <td key={x + j}>
+                  <td key={`${x ?? ""}${j}`}>
                     {j === 1 ? (
                       <Badge tone={x === "Referral" ? "violet" : "blue"}>{x}</Badge>
                     ) : j === 3 ? (
@@ -4364,7 +3787,7 @@ function Finance({
                   </td>
                 ))}
                 <td>
-                  <Badge tone="green">Paid</Badge>
+                  <Badge tone="neutral">Recorded</Badge>
                 </td>
                 <td>
                   <button
@@ -4392,7 +3815,7 @@ function Finance({
             <header>
               <div>
                 <h2>Add earning entry</h2>
-                <p>Record a salary or referral payment.</p>
+                <p>Record a salary, referral, or bonus payment.</p>
               </div>
               <button type="button" className="icon-btn" onClick={() => setModal(false)}>
                 <Icon name="x" />
@@ -4403,6 +3826,7 @@ function Finance({
                 <span>Date</span>
                 <input
                   type="date"
+                  required
                   value={newDate}
                   onChange={(e) => setNewDate(e.target.value)}
                 />
@@ -4412,6 +3836,7 @@ function Finance({
                 <select value={newType} onChange={(e) => setNewType(e.target.value)}>
                   <option>Salary</option>
                   <option>Referral</option>
+                  <option>Bonus</option>
                 </select>
               </label>
             </div>
@@ -4420,6 +3845,7 @@ function Finance({
               <div className="currency" style={{ display: "flex", alignItems: "center" }}>
                 <input
                   type="number"
+                  min="0"
                   step="any"
                   placeholder="e.g. 1500"
                   required
@@ -4440,7 +3866,7 @@ function Finance({
               <Button variant="ghost" onClick={() => setModal(false)}>
                 Cancel
               </Button>
-              <Button type="submit">Add entry</Button>
+              <Button type="submit" disabled={saving}>{saving ? "Saving…" : "Add entry"}</Button>
             </footer>
           </form>
         </div>
@@ -4457,32 +3883,30 @@ function SettingsPage({
   notifications?: boolean;
 }) {
   const [activeTab, setActiveTab] = useState(notifications ? "Reminder schedule" : "Profile");
-  const [fullName, setFullName] = useState("Alex Morgan");
-  const [email, setEmail] = useState("alex.morgan@example.com");
-  const [region, setRegion] = useState("USA");
-  const [universe, setUniverse] = useState("TOP3000");
+  const [fullName, setFullName] = useState("");
+  const [email, setEmail] = useState("");
+  const [emailVerified, setEmailVerified] = useState<boolean | null>(null);
+  const [verificationSending, setVerificationSending] = useState(false);
+  const [region, setRegion] = useState("");
+  const [regionOptions, setRegionOptions] = useState<string[]>([]);
 
   const [dailyReminders, setDailyReminders] = useState(true);
-  const [submitTarget, setSubmitTarget] = useState("4 alphas");
-  const [timezone, setTimezone] = useState("UTC−04:00 · New York");
+  const [submitTarget, setSubmitTarget] = useState("");
+  const [timezone, setTimezone] = useState("UTC");
   const [reminderTimes, setReminderTimes] = useState([true, true, false]);
-  const [emailChannel, setEmailChannel] = useState(true);
+  const [emailChannel, setEmailChannel] = useState(false);
   const [inAppChannel, setInAppChannel] = useState(true);
+  const [pushChannel, setPushChannel] = useState(false);
+  const [pushSupported, setPushSupported] = useState(false);
+  const [pushAvailable, setPushAvailable] = useState<boolean | null>(null);
+  const [pushBusy, setPushBusy] = useState(false);
 
-  // Additional tab states
-  const [defaultNeutralization, setDefaultNeutralization] = useState("SUBINDUSTRY");
-  const [defaultLookback, setDefaultLookback] = useState("20 days");
-  const [minSharpe, setMinSharpe] = useState("1.58");
+  // Local appearance preferences
   const [themePref, setThemePref] = useState("Dark");
   const [densityPref, setDensityPref] = useState("Comfortable");
-  const [githubConnected, setGithubConnected] = useState(false);
-  const [apiKey, setApiKey] = useState("wq_live_9f82c44a19b8");
-  const [showApiKey, setShowApiKey] = useState(false);
-  const [notificationHistory, setNotificationHistory] = useState([
-    { id: 1, title: "Submission window closing in 6h", time: "2 hours ago", read: false },
-    { id: 2, title: "Alpha 'Quality momentum' qualified", time: "Today 10:42", read: true },
-    { id: 3, title: "Weekly objective reward: +40 XP", time: "Yesterday", read: true },
-  ]);
+  const [notificationHistory, setNotificationHistory] = useState<any[]>([]);
+  const [sessions, setSessions] = useState<any[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
 
   // Daily Ideas Preferences State
   const [ideasEnabled, setIdeasEnabled] = useState(true);
@@ -4493,6 +3917,18 @@ function SettingsPage({
   const [shareExpressions, setShareExpressions] = useState(false);
 
   useEffect(() => {
+    const supported = window.isSecureContext && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+    setPushSupported(supported);
+    if (supported) {
+      api.push.publicKey().then((result) => setPushAvailable(Boolean(result.publicKey))).catch(() => setPushAvailable(false));
+      navigator.serviceWorker.getRegistration("/")
+        .then((registration) => registration?.pushManager.getSubscription())
+        .then((subscription) => setPushChannel(Boolean(subscription)))
+        .catch(() => setPushChannel(false));
+    } else setPushAvailable(false);
+  }, []);
+
+  useEffect(() => {
     let active = true;
 
     // Load user profile from MongoDB
@@ -4500,6 +3936,7 @@ function SettingsPage({
       if (active && u) {
         if (u.name) setFullName(u.name);
         if (u.email) setEmail(u.email);
+        setEmailVerified(Boolean(u.emailVerified));
         if (u.timezone) setTimezone(u.timezone);
         if (u.dailyTarget) setSubmitTarget(`${u.dailyTarget} alphas`);
         if (u.regions && u.regions.length > 0) setRegion(u.regions[0]);
@@ -4507,7 +3944,15 @@ function SettingsPage({
           if (u.reminderPrefs.channels.email !== undefined) setEmailChannel(u.reminderPrefs.channels.email);
           if (u.reminderPrefs.channels.inApp !== undefined) setInAppChannel(u.reminderPrefs.channels.inApp);
         }
+        if (Array.isArray(u.reminderPrefs?.offsetsMin)) {
+          setReminderTimes([180, 60, 15].map((offset) => u.reminderPrefs.offsetsMin.includes(offset)));
+          setDailyReminders(u.reminderPrefs.offsetsMin.length > 0);
+        }
       }
+    }).catch(() => {});
+
+    api.regions.list().then((res) => {
+      if (active) setRegionOptions(res.regions.map((item) => item.code));
     }).catch(() => {});
 
     // Load ideas preferences
@@ -4528,7 +3973,7 @@ function SettingsPage({
         setNotificationHistory(res.map((n: any) => ({
           id: n._id || n.id,
           title: n.message || n.title || "Notification",
-          time: n.createdAt ? new Date(n.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "Today",
+          time: n.createdAt ? new Date(n.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—",
           read: Boolean(n.readAt),
         })));
       }
@@ -4536,6 +3981,80 @@ function SettingsPage({
 
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    if (activeTab !== "Sessions") return;
+    setSessionsLoading(true);
+    api.auth.sessions().then((items) => setSessions(items || []))
+      .catch((error) => toast?.(error.message || "Could not load sessions"))
+      .finally(() => setSessionsLoading(false));
+  }, [activeTab]);
+
+  const revokeSession = async (id: string) => {
+    try {
+      await api.auth.revokeSession(id);
+      setSessions((items) => items.filter((session) => session._id !== id));
+      toast?.("Session revoked");
+    } catch (error: any) {
+      toast?.(error.message || "Could not revoke session");
+    }
+  };
+
+  const revokeOtherSessions = async () => {
+    try {
+      await api.auth.revokeOtherSessions();
+      setSessions((items) => items.filter((session) => session.current));
+      toast?.("Other sessions signed out");
+    } catch (error: any) {
+      toast?.(error.message || "Could not sign out other sessions");
+    }
+  };
+
+  const updatePushSubscription = async (enabled: boolean) => {
+    if (enabled === pushChannel) return;
+    if (!pushSupported) {
+      toast?.("Push notifications require a supported browser and a secure HTTPS connection");
+      return;
+    }
+    setPushBusy(true);
+    try {
+      if (enabled) {
+        let permission = Notification.permission;
+        if (permission === "default") permission = await Notification.requestPermission();
+        if (permission !== "granted") throw new Error("Allow notifications in your browser to enable push alerts");
+      }
+      const registration = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+      const readyRegistration = await navigator.serviceWorker.ready;
+      const activeRegistration = readyRegistration || registration;
+      const current = await activeRegistration.pushManager.getSubscription();
+      if (enabled) {
+        const { publicKey } = await api.push.publicKey();
+        const subscription = current || await activeRegistration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: vapidKeyBytes(publicKey),
+        });
+        try {
+          await api.push.subscribe(subscription.toJSON());
+        } catch (error) {
+          if (!current) await subscription.unsubscribe();
+          throw error;
+        }
+        setPushChannel(true);
+        toast?.("Push notifications enabled for this browser");
+      } else {
+        if (current) {
+          await api.push.unsubscribe(current.endpoint);
+          await current.unsubscribe();
+        }
+        setPushChannel(false);
+        toast?.("Push notifications disabled for this browser");
+      }
+    } catch (error) {
+      toast?.(error instanceof Error ? error.message : "Could not update push notifications");
+    } finally {
+      setPushBusy(false);
+    }
+  };
 
   const handleSaveIdeas = async () => {
     try {
@@ -4548,8 +4067,8 @@ function SettingsPage({
         shareExpressions,
       });
       if (toast) toast("Daily Ideas preferences saved to profile");
-    } catch {
-      if (toast) toast("Preferences saved locally");
+    } catch (error: any) {
+      if (toast) toast(error.message || "Could not save Daily Ideas preferences");
     }
   };
 
@@ -4559,25 +4078,33 @@ function SettingsPage({
         name: fullName,
         timezone,
         dailyTarget: parseInt(submitTarget) || 4,
+        ...(region ? { regions: [region] } : {}),
         reminderPrefs: {
-          channels: {
-            email: emailChannel,
-            inApp: inAppChannel,
-            push: true,
-          },
+          offsetsMin: dailyReminders ? [180, 60, 15].filter((offset, index) => reminderTimes[index]) : [],
+          channels: { email: emailChannel, inApp: inAppChannel },
         },
       });
-      await handleSaveIdeas();
-      if (toast) toast("Settings and profile successfully saved to MongoDB");
-    } catch {
-      if (toast) toast("Settings and profile updated");
+      if (toast) toast("Profile and reminder preferences saved");
+    } catch (error: any) {
+      if (toast) toast(error.message || "Could not save settings and profile");
+    }
+  };
+
+  const handleResendVerification = async () => {
+    setVerificationSending(true);
+    try {
+      const result = await api.auth.resendVerification();
+      if (toast) toast(result.alreadyVerified ? "Your email is already verified" : "Verification email sent");
+    } catch (error: any) {
+      if (toast) toast(error.message || "Could not send verification email");
+    } finally {
+      setVerificationSending(false);
     }
   };
 
   const handleExportWorkspace = () => {
     const data = {
-      user: { name: fullName, email, region, universe, submitTarget, timezone },
-      researchDefaults: { defaultNeutralization, defaultLookback, minSharpe },
+      user: { name: fullName, email, region, submitTarget, timezone },
       exportedAt: new Date().toISOString(),
       version: "QuantStorm 1.0",
     };
@@ -4596,11 +4123,9 @@ function SettingsPage({
     : [
         "Profile",
         "Daily Ideas",
-        "Research defaults",
         "Appearance",
-        "Connected accounts",
+        "Sessions",
         "Data & privacy",
-        "Plan",
       ];
 
   return (
@@ -4650,6 +4175,10 @@ function SettingsPage({
                 <label className="field">
                   <span>Daily submit target</span>
                   <input
+                    type="number"
+                    min={1}
+                    max={20}
+                    required
                     value={submitTarget}
                     onChange={(e) => setSubmitTarget(e.target.value)}
                   />
@@ -4660,9 +4189,10 @@ function SettingsPage({
                     value={timezone}
                     onChange={(e) => setTimezone(e.target.value)}
                   >
-                    <option>UTC−04:00 · New York</option>
-                    <option>UTC+00:00 · London</option>
-                    <option>UTC+08:00 · Singapore</option>
+                    <option value="UTC">UTC</option>
+                    <option value="America/New_York">America/New_York</option>
+                    <option value="Europe/London">Europe/London</option>
+                    <option value="Asia/Singapore">Asia/Singapore</option>
                   </select>
                 </label>
               </div>
@@ -4680,7 +4210,6 @@ function SettingsPage({
                       }}
                     />
                     <span>{x}</span>
-                    <small>{["1:00 PM", "3:00 PM", "3:45 PM"][i]}</small>
                   </label>
                 )
               )}
@@ -4732,7 +4261,7 @@ function SettingsPage({
                   Focus Regions
                 </span>
                 <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-                  {["USA", "EUR", "ASI"].map((r) => {
+                  {regionOptions.map((r) => {
                     const active = ideasRegions.includes(r);
                     return (
                       <button
@@ -4845,6 +4374,27 @@ function SettingsPage({
                   onChange={(e) => setEmailChannel(e.target.checked)}
                 />
               </label>
+              <label className="switch-row compact">
+                <span>
+                  <b>Browser push notifications</b>
+                  <small style={{ display: "block", color: "var(--muted)", fontSize: "12px" }}>
+                    {pushSupported
+                      ? pushAvailable === null
+                        ? "Checking push notification availability…"
+                        : pushAvailable === false
+                          ? "Push notifications are unavailable; check the server configuration and connection"
+                          : "Receive reminders and research announcements when QuantStorm is closed"
+                      : "Push notifications need a supported browser and an HTTPS connection"}
+                  </small>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={pushChannel}
+                  disabled={!pushSupported || pushBusy || (!pushAvailable && !pushChannel)}
+                  onChange={(event) => void updatePushSubscription(event.target.checked)}
+                  aria-label="Enable browser push notifications"
+                />
+              </label>
             </>
           ) : activeTab === "Notification history" ? (
             <>
@@ -4855,10 +4405,12 @@ function SettingsPage({
                 </div>
                 <Button
                   variant="ghost"
-                  onClick={() => {
-                    setNotificationHistory((prev) => prev.map((n) => ({ ...n, read: true })));
-                    api.notifications.markAllRead().catch(() => {});
-                    if (toast) toast("All notifications marked as read");
+                  onClick={async () => {
+                    try {
+                      await api.notifications.markAllRead();
+                      setNotificationHistory((prev) => prev.map((n) => ({ ...n, read: true })));
+                      if (toast) toast("All notifications marked as read");
+                    } catch (error) { if (toast) toast(error instanceof Error ? error.message : "Could not update notifications"); }
                   }}
                 >
                   Mark all as read
@@ -4868,12 +4420,12 @@ function SettingsPage({
                 {notificationHistory.map((n) => (
                   <div
                     key={n.id}
-                    onClick={() => {
+                    onClick={async () => {
                       if (!n.read) {
-                        setNotificationHistory((prev) =>
-                          prev.map((it) => (it.id === n.id ? { ...it, read: true } : it))
-                        );
-                        api.notifications.markRead(String(n.id)).catch(() => {});
+                        try {
+                          await api.notifications.markRead(String(n.id));
+                          setNotificationHistory((prev) => prev.map((it) => (it.id === n.id ? { ...it, read: true } : it)));
+                        } catch (error) { if (toast) toast(error instanceof Error ? error.message : "Could not update notification"); }
                       }
                     }}
                     style={{
@@ -4894,55 +4446,6 @@ function SettingsPage({
                     {!n.read && <Badge tone="violet">New</Badge>}
                   </div>
                 ))}
-              </div>
-            </>
-          ) : activeTab === "Research defaults" ? (
-            <>
-              <h2>Research Defaults</h2>
-              <p>Default simulation parameters used when creating new alphas.</p>
-              <div className="form-grid">
-                <label className="field">
-                  <span>Default neutralization</span>
-                  <select
-                    value={defaultNeutralization}
-                    onChange={(e) => setDefaultNeutralization(e.target.value)}
-                  >
-                    <option>SUBINDUSTRY</option>
-                    <option>INDUSTRY</option>
-                    <option>SECTOR</option>
-                    <option>MARKET</option>
-                  </select>
-                </label>
-                <label className="field">
-                  <span>Default lookback window</span>
-                  <select
-                    value={defaultLookback}
-                    onChange={(e) => setDefaultLookback(e.target.value)}
-                  >
-                    <option>5 days</option>
-                    <option>10 days</option>
-                    <option>20 days</option>
-                    <option>60 days</option>
-                  </select>
-                </label>
-                <label className="field">
-                  <span>Minimum Sharpe threshold</span>
-                  <input
-                    value={minSharpe}
-                    onChange={(e) => setMinSharpe(e.target.value)}
-                  />
-                </label>
-                <label className="field">
-                  <span>Default region</span>
-                  <select value={region} onChange={(e) => setRegion(e.target.value)}>
-                    <option>USA</option>
-                    <option>Europe</option>
-                    <option>Asia Pacific</option>
-                    <option>China</option>
-                    <option>India</option>
-                    <option>Global</option>
-                  </select>
-                </label>
               </div>
             </>
           ) : activeTab === "Appearance" ? (
@@ -4968,63 +4471,25 @@ function SettingsPage({
                 </label>
               </div>
             </>
-          ) : activeTab === "Connected accounts" ? (
+          ) : activeTab === "Sessions" ? (
             <>
-              <h2>Connected Accounts &amp; APIs</h2>
-              <p>Manage third-party authentication and WorldQuant Brain API credentials.</p>
-              <div className="connected" style={{ marginBottom: "14px" }}>
-                <b>G</b>
-                <span>
-                  <strong>Google</strong>
-                  <small>Connected as {email}</small>
-                </span>
-                <Badge tone="green">Connected</Badge>
-              </div>
-              <div className="connected" style={{ marginBottom: "18px" }}>
-                <b>GH</b>
-                <span>
-                  <strong>GitHub</strong>
-                  <small>{githubConnected ? "Connected as alexmorgan" : "Not connected"}</small>
-                </span>
-                <Button
-                  variant="secondary"
-                  onClick={() => {
-                    const next = !githubConnected;
-                    setGithubConnected(next);
-                    if (toast) toast(next ? "GitHub account linked" : "GitHub account disconnected");
-                  }}
-                >
-                  {githubConnected ? "Disconnect" : "Connect"}
-                </Button>
-              </div>
-              <h3>WorldQuant Brain API Token</h3>
-              <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                <input
-                  type={showApiKey ? "text" : "password"}
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  style={{
-                    flex: 1,
-                    fontFamily: "DM Mono, monospace",
-                    padding: "8px 12px",
-                    background: "rgba(255,255,255,0.05)",
-                    border: "1px solid var(--border)",
-                    borderRadius: "6px",
-                    color: "inherit",
-                  }}
-                />
-                <Button variant="ghost" onClick={() => setShowApiKey(!showApiKey)}>
-                  {showApiKey ? "Hide" : "Show"}
-                </Button>
-                <Button
-                  variant="secondary"
-                  onClick={() => {
-                    if (toast) toast("✓ WorldQuant Brain API Token verified and active");
-                  }}
-                >
-                  Verify
-                </Button>
-              </div>
+              <h2>Signed-in devices</h2>
+              <p>Refresh sessions are stored securely and can be revoked at any time.</p>
+              {sessions.length > 1 && <Button variant="secondary" onClick={revokeOtherSessions}>Sign out other devices</Button>}
+              {sessionsLoading ? <p>Loading sessions…</p> : sessions.length ? (
+                <div className="settings-session-list">
+                  {sessions.map((session) => (
+                    <div key={session._id} className="settings-session-row">
+                      <div>
+                        <b>{session.current ? "This device" : (session.userAgent || "Browser session")}</b>
+                        <small>{session.current ? "Current session" : session.userAgent || "Browser session"} · Last active {session.lastUsedAt ? new Date(session.lastUsedAt).toLocaleString() : "unknown"}</small>
+                        <small>Signed in {session.createdAt ? new Date(session.createdAt).toLocaleDateString() : "unknown"}</small>
+                      </div>
+                      {!session.current && <Button variant="secondary" onClick={() => revokeSession(session._id)}>Revoke</Button>}
+                    </div>
+                  ))}
+                </div>
+              ) : <p>No active sessions.</p>}
             </>
           ) : activeTab === "Data & privacy" ? (
             <>
@@ -5037,65 +4502,20 @@ function SettingsPage({
                   Export workspace JSON
                 </Button>
               </div>
-              <div className="danger-zone" style={{ marginTop: "18px" }}>
-                <h3>Delete Account</h3>
-                <p>Permanently remove your QuantStorm profile and all unsubmitted alpha drafts.</p>
-                <Button
-                  variant="danger"
-                  onClick={() => {
-                    if (toast) toast("Account deletion request submitted for processing");
-                  }}
-                >
-                  Delete account
-                </Button>
-              </div>
-            </>
-          ) : activeTab === "Plan" ? (
-            <>
-              <h2>Genius Subscription Plan</h2>
-              <p>Your current membership tier and simulation quota.</p>
-              <div style={{ padding: "18px", borderRadius: "10px", background: "rgba(109,92,231,0.08)", border: "1px solid var(--accent)", margin: "14px 0" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <div>
-                    <Badge tone="violet">CURRENT TIER</Badge>
-                    <h3 style={{ margin: "6px 0 2px" }}>Apprentice Tier (Level 2)</h3>
-                    <p style={{ margin: 0, fontSize: "12px", color: "var(--muted)" }}>Included with WorldQuant Brain active researcher qualification.</p>
-                  </div>
-                  <strong style={{ fontSize: "20px" }}>$0 / mo</strong>
-                </div>
-                <hr style={{ margin: "14px 0", border: 0, borderTop: "1px solid rgba(255,255,255,0.08)" }} />
-                <ul style={{ margin: "0 0 14px 18px", fontSize: "12px", lineHeight: "1.7", color: "var(--muted)" }}>
-                  <li>Daily submission limit: 4 alphas</li>
-                  <li>Multi-region datasets: USA, Europe, Asia Pacific</li>
-                  <li>Quant AI assistant with context awareness</li>
-                  <li>Dataset combinations generator &amp; Osmosis scoring</li>
-                </ul>
-                <Button
-                  onClick={() => {
-                    if (toast) toast("Advancing research XP unlocks Expert tier automatically");
-                  }}
-                >
-                  Upgrade to Expert
-                </Button>
-              </div>
             </>
           ) : (
             <>
               <div className="profile-line">
-                <div className="avatar large">AM</div>
+                <div className="avatar large">{String(fullName || email || "?").slice(0, 2).toUpperCase()}</div>
                 <div>
                   <b>{fullName}</b>
                   <span>{email}</span>
                 </div>
-                <Button
-                  variant="secondary"
-                  onClick={() => {
-                    if (toast) toast("Avatar updated");
-                  }}
-                >
-                  Change photo
-                </Button>
               </div>
+              {emailVerified !== null && <div className={`email-verification-row ${emailVerified ? "verified" : "unverified"}`}>
+                <div><b>{emailVerified ? "Email verified" : "Verify your email"}</b><small>{emailVerified ? "Your account email is confirmed." : "Confirm your email to keep account recovery available."}</small></div>
+                {!emailVerified && <Button variant="secondary" disabled={verificationSending} onClick={handleResendVerification}>{verificationSending ? "Sending…" : "Resend email"}</Button>}
+              </div>}
               <div className="form-grid">
                 <label className="field">
                   <span>Full name</span>
@@ -5103,203 +4523,30 @@ function SettingsPage({
                 </label>
                 <label className="field">
                   <span>Email</span>
-                  <input value={email} onChange={(e) => setEmail(e.target.value)} />
+                  <input type="email" value={email} readOnly />
                 </label>
                 <label className="field">
                   <span>Default region</span>
                   <select value={region} onChange={(e) => setRegion(e.target.value)}>
-                    <option>USA</option>
-                    <option>Europe</option>
-                    <option>Asia Pacific</option>
-                    <option>China</option>
-                    <option>India</option>
-                    <option>Global</option>
+                    {[...new Set([region, ...regionOptions])].filter(Boolean).map((code) => <option key={code}>{code}</option>)}
                   </select>
                 </label>
-                <label className="field">
-                  <span>Default universe</span>
-                  <select value={universe} onChange={(e) => setUniverse(e.target.value)}>
-                    <option>TOP3000</option>
-                    <option>TOP1000</option>
-                    <option>TOP500</option>
-                  </select>
-                </label>
-              </div>
-              <h3>Connected account</h3>
-              <div className="connected">
-                <b>G</b>
-                <span>
-                  <strong>Google</strong>
-                  <small>Connected as {email}</small>
-                </span>
-                <Badge tone="green">Connected</Badge>
               </div>
               <div className="danger-zone">
                 <h3>Data &amp; privacy</h3>
-                <p>Export a complete copy of your workspace, or permanently delete your account.</p>
-                <div style={{ display: "flex", gap: "10px" }}>
-                  <Button variant="secondary" onClick={handleExportWorkspace}>
-                    Export all data
-                  </Button>
-                  <Button
-                    variant="danger"
-                    onClick={() => {
-                      if (toast) toast("Account deletion request submitted");
-                    }}
-                  >
-                    Delete account
-                  </Button>
-                </div>
+                <p>Export a copy of your saved workspace records.</p>
+                <Button variant="secondary" onClick={handleExportWorkspace}>Export all data</Button>
               </div>
             </>
           )}
-          <footer>
-            <Button onClick={handleSave}>Save changes</Button>
-          </footer>
+          {activeTab !== "Sessions" && <footer><Button onClick={handleSave}>Save changes</Button></footer>}
         </section>
       </div>
     </div>
   );
 }
 
-function UIKit() {
-  const [demoInput, setDemoInput] = useState("Research signal v2");
-  const [demoSelect, setDemoSelect] = useState("Option 1");
-  const [demoError, setDemoError] = useState("Invalid threshold");
-  const [demoToggle, setDemoToggle] = useState(true);
-  const [btnToast, setBtnToast] = useState("");
-
-  return (
-    <div className="page">
-      <header className="page-title">
-        <div>
-          <div className="eyebrow">DESIGN SYSTEM · V1.0</div>
-          <h1>QuantStorm UI Kit</h1>
-          <p>A calm, precise interface language for high-velocity research.</p>
-        </div>
-      </header>
-      {btnToast && (
-        <div style={{ marginBottom: "14px", padding: "8px 14px", background: "rgba(109,92,231,0.12)", border: "1px solid var(--accent)", borderRadius: "6px", fontSize: "12px" }}>
-          <b>Action:</b> {btnToast}
-        </div>
-      )}
-      <div className="kit-grid">
-        <section className="card kit">
-          <h3>Color system</h3>
-          <p>Accessible semantic tokens for light and dark environments.</p>
-          <div className="swatches">
-            {[
-              ["Ink", "#111827"],
-              ["Violet", "#6D5CE7"],
-              ["Blue", "#4E8CF7"],
-              ["Success", "#18A66A"],
-              ["Warning", "#D68A16"],
-              ["Danger", "#E14B56"],
-            ].map((x) => (
-              <div key={x[0]}>
-                <i style={{ background: x[1] }} />
-                <b>{x[0]}</b>
-                <code>{x[1]}</code>
-              </div>
-            ))}
-          </div>
-        </section>
-        <section className="card kit typography">
-          <h3>Typography</h3>
-          <p>Inter-style sans UI paired with IBM Plex Mono expressions.</p>
-          <h1>Display / 40</h1>
-          <h2>Heading / 28</h2>
-          <h3>Title / 18</h3>
-          <p>Body / 14 — Reliable rhythm for dense, readable research interfaces.</p>
-          <code>rank(ts_delta(close, 5))</code>
-        </section>
-        <section className="card kit">
-          <h3>Buttons & states</h3>
-          <div className="component-row">
-            <Button onClick={() => setBtnToast("Clicked Primary Button")}>Primary</Button>
-            <Button variant="secondary" onClick={() => setBtnToast("Clicked Secondary Button")}>
-              Secondary
-            </Button>
-            <Button variant="ghost" onClick={() => setBtnToast("Clicked Ghost Button")}>
-              Ghost
-            </Button>
-            <Button variant="danger" onClick={() => setBtnToast("Clicked Danger Button")}>
-              Danger
-            </Button>
-            <Button disabled>Disabled</Button>
-          </div>
-          <h3>Badges</h3>
-          <div className="component-row">
-            <Badge>Neutral</Badge>
-            <Badge tone="violet">Research</Badge>
-            <Badge tone="green">Success</Badge>
-            <Badge tone="amber">Warning</Badge>
-            <Badge tone="red">Danger</Badge>
-          </div>
-        </section>
-        <section className="card kit">
-          <h3>Form controls</h3>
-          <div className="form-grid">
-            <label className="field">
-              <span>Input</span>
-              <input
-                value={demoInput}
-                onChange={(e) => setDemoInput(e.target.value)}
-                placeholder="Placeholder text"
-              />
-            </label>
-            <label className="field">
-              <span>Select</span>
-              <select
-                value={demoSelect}
-                onChange={(e) => setDemoSelect(e.target.value)}
-              >
-                <option value="Option 1">Option 1 · Fundamental</option>
-                <option value="Option 2">Option 2 · Analyst</option>
-                <option value="Option 3">Option 3 · Market</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>Error state</span>
-              <input
-                className="error"
-                value={demoError}
-                onChange={(e) => setDemoError(e.target.value)}
-              />
-              <small className="error-text">Check this value and try again.</small>
-            </label>
-            <label className="switch-row compact">
-              <span>
-                <b>Toggle control ({demoToggle ? "Active" : "Disabled"})</b>
-              </span>
-              <input
-                type="checkbox"
-                checked={demoToggle}
-                onChange={(e) => setDemoToggle(e.target.checked)}
-              />
-            </label>
-          </div>
-        </section>
-        <section className="card kit span-2">
-          <h3>Spacing & elevation</h3>
-          <p>
-            4px base grid · 8 / 12 / 16 / 24 / 32 / 48 · Radius 8 / 12 / 16 · Subtle borders before
-            shadows.
-          </p>
-          <div className="space-demo">
-            {[8, 12, 16, 24, 32, 48].map((x) => (
-              <i style={{ width: x, height: x }} key={x}>
-                <span>{x}</span>
-              </i>
-            ))}
-          </div>
-        </section>
-      </div>
-    </div>
-  );
-}
-
-function AppShell() {
+function AppShell({ onLogout }: { onLogout: () => void }) {
   const [page, setPage] = useState<Page>(() => {
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
@@ -5316,7 +4563,6 @@ function AppShell() {
         "Finance",
         "Notifications",
         "Settings",
-        "UI Kit",
       ];
       if (p && valid.includes(p)) return p;
     }
@@ -5329,10 +4575,13 @@ function AppShell() {
   const [toast, setToast] = useState("");
 
   // Shared platform state
-  const [alphas, setAlphas] = useState(alphaData);
-  const [submittedCount, setSubmittedCount] = useState(2);
-  const [streak, setStreak] = useState(7);
+  const [alphas, setAlphas] = useState<any[]>(alphaData);
+  const [submittedCount, setSubmittedCount] = useState(0);
+  const [dailyTarget, setDailyTarget] = useState(0);
+  const [streak, setStreak] = useState(0);
+  const [currentUser, setCurrentUser] = useState<any>(null);
   const [activeRegion, setActiveRegion] = useState("USA");
+  const [availableRegions, setAvailableRegions] = useState<string[]>(currentUser?.regions || []);
   const [regionMenu, setRegionMenu] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [commandQuery, setCommandQuery] = useState("");
@@ -5355,48 +4604,14 @@ function AppShell() {
     }
   };
 
-  const handleSubmitAlpha = (name: string) => {
-    setAlphas((prev) =>
-      prev.map((a) => (a.name === name ? { ...a, status: "Submitted" } : a))
-    );
-    setSubmittedCount((c) => {
-      const next = Math.min(4, c + 1);
-      if (next === 4) {
-        showToast(`🎉 Daily target achieved (4/4 submitted)! Research streak extended to ${streak + 1} days`);
-        setStreak((s) => s + 1);
-      } else {
-        showToast(`Alpha "${name}" submitted to simulation queue (${next}/4 completed)`);
-      }
-      return next;
-    });
-
-    const targetAlpha = alphas.find((a: any) => a.name === name);
-    if (targetAlpha) {
-      if ((targetAlpha as any)._id) {
-        api.alphas.submit((targetAlpha as any)._id).catch(() => {});
-      } else {
-        api.alphas.create({
-          expression: (targetAlpha as any).expr || targetAlpha.name,
-          region: (targetAlpha as any).region || "USA",
-          universe: (targetAlpha as any).universe || "TOP3000",
-          delay: parseInt((targetAlpha as any).delay) || 1,
-          decay: parseFloat((targetAlpha as any).decay) || 4,
-          neutralization: (targetAlpha as any).neut || "SUBINDUSTRY",
-          truncation: parseFloat((targetAlpha as any).trunc) || 0.08,
-          sharpe: parseFloat((targetAlpha as any).sharpe) || 2.14,
-          fitness: parseFloat((targetAlpha as any).fitness) || 0.72,
-          notes: (targetAlpha as any).notes || "",
-        }).then((created: any) => {
-          if (created && (created._id || created.id)) {
-            const id = created._id || created.id;
-            setAlphas((prev) =>
-              prev.map((a) => (a.name === name ? { ...a, _id: id, id, status: "Submitted" } : a))
-            );
-            api.alphas.submit(id).catch(() => {});
-          }
-        }).catch(() => {});
-      }
-    }
+  const handleSubmitAlpha = (id: string) => {
+    const targetAlpha = alphas.find((a: any) => (a._id || a.id) === id);
+    if (!targetAlpha?._id) return showToast("Save this alpha before submitting it");
+    api.alphas.submit(targetAlpha._id).then((result) => {
+      setAlphas((prev) => prev.map((a) => a._id === targetAlpha._id ? { ...a, status: "Submitted", submittedAt: new Date().toISOString() } : a));
+      setSubmittedCount(result.dailySubmittedCount);
+      showToast(`Alpha submitted (${result.dailySubmittedCount} submitted today)`);
+    }).catch((error) => showToast(error.message || "Could not submit alpha"));
   };
 
   // Sync state with backend on mount
@@ -5406,19 +4621,24 @@ function AppShell() {
       const session = await api.auth.ensureSession();
       if (!isMounted) return;
       if (session?.user) {
+        setCurrentUser(session.user);
+        if (session.user.regions?.[0]) setActiveRegion(session.user.regions[0]);
         if (session.quota?.submittedToday !== undefined) {
           setSubmittedCount(session.quota.submittedToday);
         }
+        if (session.quota?.target !== undefined) setDailyTarget(session.quota.target);
         if (session.user.streak?.current !== undefined) {
           setStreak(session.user.streak.current);
         }
       }
+      const regionData = await api.regions.list();
+      if (isMounted) setAvailableRegions((regionData?.regions || []).map((item: any) => item.code));
       const alphaRes = await api.alphas.list();
-      if (isMounted && alphaRes && Array.isArray(alphaRes.items) && alphaRes.items.length > 0) {
+      if (isMounted && alphaRes && Array.isArray(alphaRes.items)) {
         setAlphas(alphaRes.items.map((b: any) => ({
           id: b._id || b.id,
           _id: b._id,
-          name: b.expression ? b.expression.slice(0, 30) : "Alpha " + b.region,
+          name: b.name || (b.expression ? b.expression.slice(0, 30) : "Alpha"),
           expr: b.expression || "",
           region: b.region || "USA",
           universe: b.universe || "TOP3000",
@@ -5426,20 +4646,24 @@ function AppShell() {
           decay: String(b.decay ?? 4),
           neut: b.neutralization || "SUBINDUSTRY",
           trunc: String(b.truncation ?? 0.08),
-          sharpe: b.sharpe || 2.14,
-          fitness: b.fitness || 0.72,
-          turnover: `${b.turnover || 12}%`,
-          returns: `${Math.round((b.sharpe || 1.8) * 12)}%`,
-          margin: "18.2 bps",
+          sharpe: b.sharpe,
+          fit: b.fitness,
+          fitness: b.fitness,
+          turnover: b.turnover,
+          selfCorrelation: b.selfCorrelation,
           status: b.status === "submitted" ? "Submitted" : b.status === "archived" ? "Archived" : "Saved",
-          color: b.qualifying ? "emerald" : "sky",
-          datasets: b.datasets || ["Market"],
-          tags: b.tags || ["momentum"],
+          qualifying: b.qualifying,
+          datasets: b.datasets || [],
+          datafields: b.datafields || [],
+          tags: b.tags || [],
           notes: b.notes || "",
-          created: b.createdAt ? new Date(b.createdAt).toISOString().slice(0, 10) : "Today",
+          createdAt: b.createdAt,
+          submittedAt: b.submittedAt,
         })));
       }
-    })();
+    })().catch((error) => {
+      if (isMounted) showToast(error instanceof Error ? error.message : "Could not load account data");
+    });
     return () => { isMounted = false; };
   }, []);
 
@@ -5501,6 +4725,8 @@ function AppShell() {
           onCopy={copyText}
           submittedCount={submittedCount}
           activeRegion={activeRegion}
+          currentUser={currentUser}
+          dailyTarget={dailyTarget}
         />
       );
     if (page === "Daily Ideas")
@@ -5513,7 +4739,7 @@ function AppShell() {
             setPrefilledAlpha(prefill);
             setPrefilledExpr(prefill.expression);
             setPage("Alpha Vault");
-            showToast(`Idea "${prefill.name}" loaded into Alpha Vault (+25 XP awarded)`);
+            showToast(`Idea "${prefill.name}" loaded into Alpha Vault`);
           }}
           onAskAi={(prompt) => {
             setAiPrompt(prompt);
@@ -5527,6 +4753,7 @@ function AppShell() {
         <AlphaVault
           toast={showToast}
           onCopy={copyText}
+          regions={availableRegions}
           alphas={alphas}
           setAlphas={setAlphas}
           onSubmitAlpha={handleSubmitAlpha}
@@ -5577,6 +4804,7 @@ function AppShell() {
         <Pyramid
           go={setPage}
           toast={showToast}
+          currentUser={currentUser}
           onStartAlpha={(expr) => {
             setPrefilledExpr(expr);
             setPage("Alpha Vault");
@@ -5586,7 +4814,6 @@ function AppShell() {
     if (page === "Finance") return <Finance toast={showToast} onCopy={copyText} />;
     if (page === "Settings") return <SettingsPage toast={showToast} />;
     if (page === "Notifications") return <SettingsPage toast={showToast} notifications />;
-    if (page === "UI Kit") return <UIKit />;
     return (
       <Dashboard
         go={setPage}
@@ -5596,9 +4823,11 @@ function AppShell() {
         onCopy={copyText}
         submittedCount={submittedCount}
         activeRegion={activeRegion}
+          currentUser={currentUser}
+          dailyTarget={dailyTarget}
       />
     );
-  }, [page, alphas, submittedCount, streak, activeRegion, prefilledExpr, prefilledAlpha, aiPrompt]);
+  }, [page, alphas, submittedCount, streak, activeRegion, currentUser, dailyTarget, prefilledExpr, prefilledAlpha, aiPrompt]);
 
   return (
     <div
@@ -5621,7 +4850,7 @@ function AppShell() {
             >
               <Icon name={n.icon} />
               <span>{n.label}</span>
-              {i === 2 && <small>12</small>}
+              {i === 2 && <small>{alphas.length}</small>}
             </button>
           ))}
         </nav>
@@ -5641,13 +4870,14 @@ function AppShell() {
             </span>
           </div>
           <button type="button" onClick={() => setPage("Settings")}>
-            <div className="avatar">AM</div>
+            <div className="avatar">{String(currentUser?.name || currentUser?.email || "?").slice(0, 2).toUpperCase()}</div>
             <span>
-              <b>Alex Morgan</b>
-              <small>Apprentice</small>
+              <b>{currentUser?.name || currentUser?.email || "Researcher"}</b>
+              <small>{currentUser?.email || "Account"}</small>
             </span>
             <Icon name="chevron" />
           </button>
+          <button type="button" onClick={onLogout} aria-label="Sign out">Sign out</button>
         </div>
       </aside>
       <div className="workspace">
@@ -5679,8 +4909,8 @@ function AppShell() {
                 <i style={{ opacity: submittedCount >= 1 ? 1 : 0.2 }} />
                 <i style={{ opacity: submittedCount >= 2 ? 1 : 0.2 }} />
               </span>
-              <b>{submittedCount}/4 submitted</b>
-              <small>6h left</small>
+              <b>{submittedCount}/{dailyTarget || "—"} submitted</b>
+              <small>{activeRegion}</small>
             </div>
 
             <div style={{ position: "relative" }}>
@@ -5693,7 +4923,7 @@ function AppShell() {
               </button>
               {regionMenu && (
                 <div className="region-dropdown">
-                  {["USA", "Europe", "Asia Pacific", "China", "India", "Global"].map((r) => (
+                  {availableRegions.map((r) => (
                     <button
                       type="button"
                       key={r}
@@ -5707,6 +4937,7 @@ function AppShell() {
                       {r}
                     </button>
                   ))}
+                  {!availableRegions.length && <span>No regions configured for this account.</span>}
                 </div>
               )}
             </div>
@@ -5737,7 +4968,7 @@ function AppShell() {
               onClick={() => setPage("Settings")}
               title="Settings"
             >
-              AM
+              {String(currentUser?.name || currentUser?.email || "?").slice(0, 2).toUpperCase()}
             </div>
           </div>
         </header>
@@ -5874,6 +5105,24 @@ function AppShell() {
 }
 
 export default function App() {
-  const [authed, setAuthed] = useState(true);
-  return authed ? <AppShell /> : <Auth onDone={() => setAuthed(true)} />;
+  const [authed, setAuthed] = useState(false);
+  const [checkingSession, setCheckingSession] = useState(true);
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("oauth") === "success") {
+      url.searchParams.delete("oauth");
+      window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+    const path = window.location.pathname.replace(/\/+$/, "");
+    const accountAction = ["/reset-password", "/verify-email", "/accept-invite"].some((route) => path.endsWith(route));
+    if (accountAction) {
+      setAuthed(false);
+      setCheckingSession(false);
+      return;
+    }
+    api.auth.ensureSession().then(() => setAuthed(true)).catch(() => setAuthed(false)).finally(() => setCheckingSession(false));
+  }, []);
+  if (checkingSession) return <div className="auth-shell" aria-live="polite">Loading your account…</div>;
+  if (!authed) return <Auth onDone={() => setAuthed(true)} />;
+  return <AppShell onLogout={() => { api.auth.logout().finally(() => setAuthed(false)); }} />;
 }
